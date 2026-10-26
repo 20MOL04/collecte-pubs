@@ -18,7 +18,8 @@ on:
         description: "Mots-cles par pays (ex. 12). Vide = le budget de nuit."
         required: false
 concurrency:
-  group: pub-track-collecte
+  # Un groupe par liste de pays : plusieurs rattrapages tournent en parallele, sur des pays differents.
+  group: collecte-${{ github.event.inputs.pays || 'nuit' }}
   cancel-in-progress: false
 jobs:
   collecter:
