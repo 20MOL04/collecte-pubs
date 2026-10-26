@@ -1,0 +1,17 @@
+{
+  "name": "collecte-pubs",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "collecter": "tsx scripts/pub-track/collecter.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.112.3",
+    "sharp": "0.35.3",
+    "tsx": "4.23.13",
+    "typescript": "5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5"
+  }
+}

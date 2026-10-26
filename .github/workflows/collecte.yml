@@ -1,0 +1,57 @@
+name: Collecte de nuit
+# Collecte de nuit des pubs publiques. Depot public : minutes GitHub Actions gratuites et illimitees.
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      pays:
+        description: "Pays (ex. CI,SN,CM). Vide = ceux du jour."
+        required: false
+      mots:
+        description: "Mots-cles (ex. savon,creme). Vide = la rotation."
+        required: false
+      depuis:
+        description: "Rattrapage : seulement les pubs lancees depuis N jours (ex. 30). Vide = le melange de nuit."
+        required: false
+      mots_par_pays:
+        description: "Mots-cles par pays (ex. 12). Vide = le budget de nuit."
+        required: false
+concurrency:
+  group: pub-track-collecte
+  cancel-in-progress: false
+jobs:
+  collecter:
+    runs-on: ubuntu-latest
+    # Depot public : minutes gratuites et illimitees. Une nuit ~54 min.
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Installer Playwright et Chromium
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+      - name: Collecter
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Vidéos TikTok des vendeurs (09/10/2026). Absente : la collecte vidéo est simplement sautée.
+          SCRAPECREATORS_API_KEY: ${{ secrets.SCRAPECREATORS_API_KEY }}
+          # Nom du produit et verdict « vend ou non » (09/10/2026). Absente : le nommage est saute.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PAYS: ${{ github.event.inputs.pays }}
+          MOTS: ${{ github.event.inputs.mots }}
+          DEPUIS: ${{ github.event.inputs.depuis }}
+          MOTS_PAR_PAYS: ${{ github.event.inputs.mots_par_pays }}
+        run: |
+          ARGS=""
+          if [ -n "$PAYS" ]; then ARGS="$ARGS --pays $PAYS"; fi
+          if [ -n "$MOTS" ]; then ARGS="$ARGS --mots $MOTS"; fi
+          if [ -n "$DEPUIS" ]; then ARGS="$ARGS --depuis $DEPUIS"; fi
+          if [ -n "$MOTS_PAR_PAYS" ]; then ARGS="$ARGS --mots-par-pays $MOTS_PAR_PAYS"; fi
+          npx tsx scripts/pub-track/collecter.ts $ARGS
