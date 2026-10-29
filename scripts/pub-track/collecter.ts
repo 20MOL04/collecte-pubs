@@ -43,13 +43,12 @@ import {
 import { choisirRequetes, type StatRequete } from '../../lib/pub-track/requetes';
 import { VERIFICATION, annonceursAVerifier, pageComplete, verdictPage, type PubCandidate, type PubReperee } from '../../lib/pub-track/verification';
 import { estPaysPubTrack, paysDuJour, PAYS_PUB_TRACK } from '../../lib/pub-track/pays';
-import { schemaTikTokConnu, versLigneTikTok } from './analyser-tiktok';
 import { schemaVideoTikTokConnu, versLigneVideoTikTok } from './analyser-tiktok-videos';
 import { nommerProduits } from './nommer-produits';
-import { requetesOccident } from '../../lib/pub-track/occident';
-import { phraseScore, scorePub } from '../../lib/pub-track/score';
+import { requetesOccidentOrientees, type ProduitAOrienter } from '../../lib/pub-track/occident';
+import { scoresDeNuit, type PubAScorer } from '../../lib/pub-track/score-nuit';
 import { analyserPage, technologieDepuisDomaine, technologieDepuisUrl, technologieSansSite } from '../../lib/pub-track/technologie';
-import { CATEGORIES_VISIBLES, categorieOccident, categoriePub, vendeursAncres, type CategoriePub, type EntreeCategorie } from '../../lib/pub-track/categorie';
+import { CATEGORIES_VISIBLES, categorieAvecClasseur, categorieOccident, categoriePub, vendeursAncres, type CategoriePub, type EntreeCategorie } from '../../lib/pub-track/categorie';
 import { clesProduit } from '../../lib/pub-track/produit-cle';
 import { offresDe, prixFcfa } from '../../lib/pub-track/offre';
 import { estDestination } from '../../lib/pub-track/destination';
@@ -77,21 +76,19 @@ const MODE_CRENEAU = process.argv.includes('--creneau');
 const pause = ([min, max]: readonly [number, number]) =>
   new Promise((r) => setTimeout(r, min + Math.random() * (max - min)));
 /**
- * TikTok passe tous les N jours (ses « Top Ads » couvrent 30 jours et bougent lentement), ou sur
- * demande. Cette nuit-là, Meta lui cède ses minutes : la nuit entière tient dans le quota gratuit.
+ * TikTok (lot 7, 30/10/2026). Les « Top Ads » du Creative Center sont RETIRÉS : ils ne se lisaient qu'en se faisant
+ * passer pour un navigateur ordinaire et en rejouant les signatures de la page, ce que Pub Track ne fait plus pour
+ * aucune source (lot 1). L'API officielle de TikTok (Commercial Content API) ne couvre que l'Union européenne.
+ * Reste la source PAYANTE des vidéos de vendeurs (ScrapeCreators) : elle ne part que sur demande explicite
+ * (`--tiktok-videos`) ET avec une clé posée, jamais par défaut. Aucune tâche planifiée ne la demande : il faut
+ * l'accord écrit de l'équipe sur le budget.
  */
-const NUIT_TIKTOK =
-  !process.argv.includes('--videos-seul') &&
-  (process.argv.includes('--tiktok') ||
-  process.argv.includes('--tiktok-seul') ||
-  (!process.argv.includes('--sans-tiktok') && Math.floor(Date.now() / 86_400_000) % BUDGET_COLLECTE.tiktokTousLesNJours === 0));
-/** Les vidéos TikTok des vendeurs (ScrapeCreators) passent chaque nuit dès qu'une clé est posée. */
-const VIDEOS_TIKTOK = !!process.env.SCRAPECREATORS_API_KEY?.trim() && !process.argv.includes('--sans-tiktok');
+const VIDEOS_TIKTOK = process.argv.includes('--tiktok-videos') && !!process.env.SCRAPECREATORS_API_KEY?.trim() && !process.argv.includes('--sans-tiktok');
 /** Le nommage des produits passe chaque nuit dès que la clé Gemini est posée. */
 const NOMMAGE = !!process.env.GEMINI_API_KEY?.trim();
 const tempsEcoule = () =>
   (Date.now() - debut) / 60_000 >
-  BUDGET_COLLECTE.dureeMaxMinutes - (NUIT_TIKTOK ? BUDGET_COLLECTE.tiktokMinutes : 0) - (VIDEOS_TIKTOK ? BUDGET_COLLECTE.tiktokVideosMinutes : 0) - (NOMMAGE ? BUDGET_COLLECTE.nommageMinutes : 0) - BUDGET_COLLECTE.rafraichirMinutes - BUDGET_COLLECTE.occidentMinutes;
+  BUDGET_COLLECTE.dureeMaxMinutes - (VIDEOS_TIKTOK ? BUDGET_COLLECTE.tiktokVideosMinutes : 0) - (NOMMAGE ? BUDGET_COLLECTE.nommageMinutes : 0) - BUDGET_COLLECTE.rafraichirMinutes - BUDGET_COLLECTE.occidentMinutes;
 
 /** `depuis` (AAAA-MM-JJ) : seulement les pubs lancées depuis ce jour, filtre de la bibliothèque elle-même. */
 function urlBibliotheque(pays: string, mot: string, depuis: string | null = null): string {
@@ -218,7 +215,7 @@ async function lirePage(url: string): Promise<{ html: string; adresse: string } 
 }
 
 /**
- * Sur quoi vend cette boutique. Décision de l'équipe du 07/10/2026 : on lit
+ * Sur quoi vend cette boutique. Décision du équipe du 07/10/2026 : on lit
  * LA PAGE DE VENTE de la pub (son lien), pas seulement l'accueil du domaine,
  * parce qu'un vendeur digital monte souvent sa page sur son propre domaine et
  * branche un bouton de paiement Chariow, Maketou ou Selar. Dans l'ordre :
@@ -299,8 +296,13 @@ async function toutLire<T>(lire: (de: number, a: number) => PromiseLike<{ data: 
  */
 async function classerBase(sb: SupabaseClient): Promise<number> {
   const colonnes =
-    'id, source, marche, categorie, annonceur_id, annonceur_nom, texte, titre, appel_action, lien, domaine, destination, boutique_cle, langue, produit_famille';
-  const lignes = await toutLire<Record<string, string | null>>((de, a) => sb.from('pub_track_pubs').select(colonnes).order('id').range(de, a));
+    'id, source, marche, categorie, annonceur_id, annonceur_nom, texte, titre, appel_action, lien, domaine, destination, boutique_cle, langue, produit_famille, verdict_ia';
+  const lire = (c: string) => toutLire<Record<string, string | null>>((de, a) => sb.from('pub_track_pubs').select(c).order('id').range(de, a));
+  // Le type vu par le classeur IA (117) : sans la migration, les règles seules décident, comme avant.
+  const lignes = await lire(`${colonnes}, type_ia`).catch((err: Error) => {
+    if (!colonneAbsente(err.message)) throw err;
+    return lire(colonnes);
+  });
   const technos = new Map(
     (await toutLire<{ cle: string; technologie: string }>((de, a) => sb.from('pub_track_boutiques').select('cle, technologie').range(de, a))).map((b) => [
       b.cle,
@@ -324,7 +326,12 @@ async function classerBase(sb: SupabaseClient): Promise<number> {
   const afrique = lignes.filter((l) => l.source === 'meta' && l.marche !== 'occident');
   // Le vendeur se juge sur TOUTES ses pubs (audit du 08/10/2026).
   const ancres = vendeursAncres(afrique.map((l) => ({ annonceurId: l.annonceur_id, entree: entree(l) })));
+  const vend = (l: Record<string, string | null>) => (l.verdict_ia === 'produit' ? true : l.verdict_ia === 'pas_produit' ? false : null);
   const categorie = (l: Record<string, string | null>): string | null => {
+    const regles = categorieRegles(l);
+    return regles ? categorieAvecClasseur(regles as CategoriePub, l.type_ia, vend(l)) : regles;
+  };
+  const categorieRegles = (l: Record<string, string | null>): string | null => {
     if (l.marche === 'occident') {
       return categorieOccident({
         texte: l.texte ?? '',
@@ -385,35 +392,50 @@ async function recalculer(sb: SupabaseClient): Promise<void> {
   await etapeRecalcul('historique', () => sb.rpc('pub_track_recalculer_historique', { p_jour: jour }));
 }
 
+/**
+ * Le score v2 de TOUTES les pubs actives, sa phrase et son statut prouvé (lot 4, lib/pub-track/score-nuit.ts).
+ * Sans la migration 116 (pas de `verifiee_le`), aucune preuve : aucune pub ne passe gagnante. Sans la 118,
+ * le score et la phrase passent par l'ancienne porte, sans statut.
+ */
 async function recalculerScores(sb: SupabaseClient): Promise<number> {
-  const groupes = new Map(
+  const variantesGroupe = new Map(
     (await toutLire<{ groupe_cle: string; variantes: number }>((de, a) => sb.from('pub_track_groupes').select('groupe_cle, variantes').range(de, a))).map((g) => [g.groupe_cle, g.variantes]),
   );
-  const boutiques = new Map(
-    (await toutLire<{ cle: string; pubs_actives: number; variation_7j: number | null }>((de, a) => sb.from('pub_track_boutiques').select('cle, pubs_actives, variation_7j').range(de, a))).map(
-      (b) => [b.cle, b],
-    ),
+  const croissanceBoutique = new Map(
+    (await toutLire<{ cle: string; variation_7j: number | null }>((de, a) => sb.from('pub_track_boutiques').select('cle, variation_7j').range(de, a))).map((b) => [b.cle, b.variation_7j]),
   );
-  const pubs = await toutLire<{ id: string; jours_actifs: number; groupe_cle: string | null; variantes_source: number; boutique_cle: string | null; reseaux: string[] }>((de, a) =>
-    sb.from('pub_track_pubs').select('id, jours_actifs, groupe_cle, variantes_source, boutique_cle, reseaux').eq('active', true).order('id').range(de, a),
+  const croissanceAnnonceur = new Map(
+    (await toutLire<{ source: string; page_id: string; variation_7j: number | null }>((de, a) => sb.from('pub_track_annonceurs').select('source, page_id, variation_7j').range(de, a))).map((x) => [
+      `${x.source}:${x.page_id}`,
+      x.variation_7j,
+    ]),
   );
-  const scores = pubs.map((p) => {
-    const b = p.boutique_cle ? boutiques.get(p.boutique_cle) : undefined;
-    const signaux = {
-      joursActifs: p.jours_actifs,
-      variantes: (p.groupe_cle && groupes.get(p.groupe_cle)) || p.variantes_source,
-      pubsActivesBoutique: b?.pubs_actives ?? 1,
-      croissance7j: b?.variation_7j ?? null,
-      reseaux: Math.max(1, p.reseaux.length),
-    };
-    return { id: p.id, score: scorePub(signaux), phrase: phraseScore(signaux) };
+  const colonnesScore = 'id, source, jours_actifs, groupe_cle, variantes_source, boutique_cle, annonceur_id, categorie, marche, produit_famille, pays, prix_fcfa, offres, date_debut';
+  const lirePubs = (c: string) => toutLire<PubAScorer>((de, a) => sb.from('pub_track_pubs').select(c).eq('active', true).order('id').range(de, a));
+  const pubs = await lirePubs(`${colonnesScore}, verifiee_le`).catch((err: Error) => {
+    if (!colonneAbsente(err.message)) throw err;
+    return lirePubs(colonnesScore);
   });
+  const scores = scoresDeNuit(pubs, { variantesGroupe, croissanceBoutique, croissanceAnnonceur }, new Date());
   let poses = 0;
+  let v2 = true;
   for (let i = 0; i < scores.length; i += 1000) {
-    const { data, error } = await sb.rpc('pub_track_poser_scores', { p_scores: scores.slice(i, i + 1000) });
+    const lot = scores.slice(i, i + 1000);
+    if (v2) {
+      const { data, error } = await sb.rpc('pub_track_poser_scores_v2', { p_scores: lot });
+      if (!error) {
+        poses += Number(data) || 0;
+        continue;
+      }
+      console.error(`scores v2 : ${error.message} ; repli sur l ancienne porte, sans statut`);
+      v2 = false;
+    }
+    const { data, error } = await sb.rpc('pub_track_poser_scores', { p_scores: lot.map(({ id, score, phrase }) => ({ id, score, phrase })) });
     if (error) throw new Error(`scores : ${error.message}`);
     poses += Number(data) || 0;
   }
+  const statuts = scores.reduce((n, x) => ({ ...n, [x.statut ?? 'aucun']: (n[x.statut ?? 'aucun'] ?? 0) + 1 }), {} as Record<string, number>);
+  console.log(`Scores v2 : ${scores.length} pubs actives, ${statuts.gagnante ?? 0} gagnantes, ${statuts.montante ?? 0} montantes, ${statuts.nouvelle ?? 0} nouvelles.`);
   return poses;
 }
 
@@ -511,107 +533,6 @@ async function ecrireRecherche(
   }
   await ecrireParLots(sb, aEcrire);
   return { nouvelles: touchees.filter((l) => !enBase.has(l.id_source)).length, miniatures };
-}
-
-/* ── TikTok : les « Top Ads » du Creative Center (lot 7, 09/10/2026) ─────────────────────── */
-
-const TOPADS = 'https://ads.tiktok.com/business/creativecenter/inspiration/topads/pc/en?period=30&region=';
-const API_TIKTOK = 'https://ads.tiktok.com/creative_radar_api/v1/top_ads/v2';
-const ORDRES_TIKTOK = ['for_you', 'like', 'reach', 'ctr'] as const;
-// Le Creative Center refuse un navigateur qui se présente comme automatisé : il reste blanc.
-const NAVIGATEUR_ORDINAIRE = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
-
-/**
- * La page publique signe ses appels (en-têtes `timestamp`, `user-sign`, `anonymous-user-id`) ;
- * on charge UNE page comme un visiteur, on relit ces en-têtes, puis on lit les listes et les
- * fiches avec eux : 0,6 s par fiche au lieu de 10 s par page (mesuré le 09/10/2026).
- */
-async function collecterTikTok(
-  navigateur: { newContext(o: Record<string, unknown>): Promise<any> },
-  sb: SupabaseClient | null,
-  pays: readonly string[],
-  avecMiniature: Set<string>,
-  budget: { miniatures: number },
-): Promise<{ listes: number; lues: number; ecrites: number; utiles: number; nouvelles: number; miniatures: number }> {
-  const fin = Date.now() + BUDGET_COLLECTE.tiktokMinutes * 60_000;
-  const contexte = await navigateur.newContext({ locale: 'en-US', userAgent: NAVIGATEUR_ORDINAIRE, viewport: { width: 1300, height: 900 } });
-  const page = await contexte.newPage();
-  let entetes: Record<string, string> | null = null;
-  page.on('request', (r: any) => {
-    if (!entetes && String(r.url()).includes('top_ads/v2/list')) {
-      entetes = Object.fromEntries(Object.entries(r.headers() as Record<string, string>).filter(([k]) => !/^(sec-|user-agent|referer|accept-encoding|cookie)/.test(k)));
-    }
-  });
-  const sortie = { listes: 0, lues: 0, ecrites: 0, utiles: 0, nouvelles: 0, miniatures: 0 };
-  try {
-    await page.goto(`${TOPADS}NG`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    for (let i = 0; i < 40 && !entetes; i++) await pause([400, 600]);
-    if (!entetes) throw new Error('en-tetes signes introuvables : la page Top Ads a change');
-    const lire = async (url: string): Promise<Record<string, any> | null> => {
-      const t: string = await page.evaluate(
-        async ([u, h]: [string, Record<string, string>]) => (await fetch(u, { headers: h, credentials: 'include' })).text(),
-        [url, entetes],
-      );
-      try {
-        const j = JSON.parse(t);
-        return j?.code === 0 ? j.data : null;
-      } catch {
-        return null;
-      }
-    };
-
-    // Chaque passage trie autrement (pour vous, likes, portée, taux de clic) : la même liste de 20
-    // n'est pas relue, et TikTok freine au-delà d'une centaine d'appels (mesuré le 09/10/2026).
-    const tri = ORDRES_TIKTOK[Math.floor(Date.now() / 86_400_000 / BUDGET_COLLECTE.tiktokTousLesNJours) % ORDRES_TIKTOK.length];
-    const periode = Number(arg('tiktok-periode')) === 180 ? 180 : 30;
-    const elements = new Map<string, Record<string, unknown>>();
-    for (const p of pays) {
-      if (Date.now() > fin) break;
-      for (let n = 1; n <= BUDGET_COLLECTE.tiktokPagesParPays; n++) {
-        const data = await lire(`${API_TIKTOK}/list?period=${periode}&page=${n}&limit=20&order_by=${tri}&country_code=${p}`);
-        sortie.listes += 1;
-        const mats = Array.isArray(data?.materials) ? (data.materials as Record<string, unknown>[]) : [];
-        if (!schemaTikTokConnu(mats)) throw new SchemaChange(`tiktok:${Object.keys(mats[0] ?? {}).sort().join(',')}`);
-        for (const m of mats) elements.set(String(m.id), m);
-        await pause([400, 900]);
-        if (mats.length < 20) break;
-      }
-    }
-    sortie.lues = elements.size;
-
-    // Une pub déjà lue cette semaine ne coûte pas une fiche de plus.
-    const recentes = new Set<string>();
-    // `--tiktok-relire` : relire aussi les pubs vues cette semaine, pour les reclasser après un changement de règle.
-    if (sb && elements.size && !process.argv.includes('--tiktok-relire')) {
-      const ids = [...elements.keys()];
-      const depuis = new Date(Date.now() - 7 * 86_400_000).toISOString();
-      for (let i = 0; i < ids.length; i += 300) {
-        const { data } = await sb.from('pub_track_pubs').select('id_source').eq('source', 'tiktok').gte('vu_le', depuis).in('id_source', ids.slice(i, i + 300));
-        for (const r of (data ?? []) as { id_source: string }[]) recentes.add(r.id_source);
-      }
-    }
-    const lignes: LignePub[] = [];
-    for (const [id, element] of elements) {
-      if (Date.now() > fin) break;
-      if (recentes.has(id)) continue;
-      const fiche = await lire(`${API_TIKTOK}/detail?material_id=${id}`);
-      const l = versLigneTikTok(element, fiche);
-      if (l) lignes.push({ ...l, requete: `tiktok · ${l.pays.join(',')}` });
-      await pause([250, 600]);
-    }
-    sortie.ecrites = lignes.length;
-    sortie.utiles = lignes.filter((l) => (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie)).length;
-    if (sb && lignes.length) {
-      const ecrit = await ecrireRecherche(sb, lignes, avecMiniature, budget);
-      sortie.nouvelles = ecrit.nouvelles;
-      sortie.miniatures = ecrit.miniatures;
-    } else if (!sb) {
-      for (const l of lignes) console.log(`  ${l.categorie.padEnd(12)} ${l.pays.join(',').padEnd(6)} ${l.appel_action.padEnd(14)} ${(l.domaine ?? l.destination).slice(0, 26).padEnd(26)} | ${l.texte.replace(/\s+/g, ' ').slice(0, 80)}`);
-    }
-  } finally {
-    await contexte.close().catch(() => undefined);
-  }
-  return sortie;
 }
 
 /* ── TikTok : les vidéos des vendeurs, boostées ou non (ScrapeCreators, 09/10/2026) ─────────── */
@@ -892,6 +813,25 @@ async function fermerJournal(sb: SupabaseClient, id: string, champs: Record<stri
   if (repli.error) console.error(`journal : ${repli.error.message}`);
 }
 
+/**
+ * Les produits africains qui gagnent ou qui montent cette semaine (lot 6) : la matière des recherches occidentales
+ * orientées. Sans la migration 118 (pas de statut), une liste vide : la rotation seule, comme avant.
+ */
+async function produitsAOrienter(sb: SupabaseClient): Promise<ProduitAOrienter[]> {
+  const { data, error } = await sb
+    .from('pub_track_pubs')
+    .select('produit_nom, produit_recherche')
+    .in('statut_pt', ['gagnante', 'montante'])
+    .eq('marche', 'afrique')
+    .eq('categorie', 'physique')
+    .eq('active', true)
+    .not('produit_recherche', 'is', null)
+    .order('score', { ascending: false })
+    .limit(40);
+  if (error) return [];
+  return ((data ?? []) as { produit_nom: string | null; produit_recherche: string | null }[]).map((l) => ({ nom: l.produit_nom, recherche: l.produit_recherche }));
+}
+
 /** Le créneau en cours, pour fermer sa ligne même quand la nuit s'arrête sur une panne. */
 let journalOuvert: { sb: SupabaseClient; id: string; nuit: string; creneau: number } | null = null;
 
@@ -1076,7 +1016,7 @@ async function main(): Promise<void> {
 
   const debutMeta = Date.now();
   let finReelleMeta = debutMeta;
-  const seulementTikTok = process.argv.includes('--tiktok-seul') || process.argv.includes('--videos-seul') || process.argv.includes('--rafraichir-seul');
+  const seulementTikTok = process.argv.includes('--videos-seul') || process.argv.includes('--rafraichir-seul');
   try {
     if (MODE_CRENEAU) {
       // LA FILE DE LA NUIT : l'Afrique, puis l'Occident, puis le rafraîchissement des vidéos, dans le
@@ -1117,7 +1057,8 @@ async function main(): Promise<void> {
           const d = memoire.get(cleOccident(po))?.get(mot)?.derniere;
           return !!d && Date.parse(d) >= depuisNuit.getTime();
         };
-        for (const { pays: po, mot } of requetesOccident(jourDeNuit(nuit), BUDGET_COLLECTE.occidentRequetes)) {
+        const orientees = requetesOccidentOrientees(await produitsAOrienter(sb), jourDeNuit(nuit), BUDGET_COLLECTE.occidentRequetes);
+        for (const { pays: po, mot } of orientees) {
           if (Date.now() > fin) break;
           if (faitesOccident(po, mot)) continue;
           if (!(await chercherOccident(po, mot))) {
@@ -1138,7 +1079,7 @@ async function main(): Promise<void> {
       }
       if (sb && statut === 'ok') {
         const finOccident = Date.now() + BUDGET_COLLECTE.occidentMinutes * 60_000;
-        for (const { pays: po, mot } of requetesOccident(new Date(), BUDGET_COLLECTE.occidentRequetes)) {
+        for (const { pays: po, mot } of requetesOccidentOrientees(await produitsAOrienter(sb), new Date(), BUDGET_COLLECTE.occidentRequetes)) {
           if (Date.now() > finOccident) break;
           if (!(await chercherOccident(po, mot))) break;
         }
@@ -1168,19 +1109,6 @@ async function main(): Promise<void> {
       } catch (err) {
         stats.erreurs += 1;
         console.error('TikTok videos : echec', err instanceof Error ? err.message : err);
-      }
-    }
-    if (NUIT_TIKTOK && statut === 'ok') {
-      try {
-        // `--pays` restreint aussi TikTok ; sinon les 54 pays, une page de liste coûte moins d'une seconde.
-        const tt = await collecterTikTok(navigateur, sb, arg('pays') ? pays : PAYS_PUB_TRACK.map((x) => x.code), avecMiniature, budgetMiniatures);
-        stats.pubs_lues += tt.lues;
-        stats.pubs_nouvelles += tt.nouvelles;
-        miniatures += tt.miniatures;
-        console.log(`TikTok : ${tt.listes} listes, ${tt.lues} pubs lues, ${tt.ecrites} retenues (pays africains), ${tt.utiles} produits, ${tt.nouvelles} nouvelles.`);
-      } catch (err) {
-        stats.erreurs += 1;
-        console.error('TikTok : echec', err instanceof Error ? err.message : err);
       }
     }
   } finally {

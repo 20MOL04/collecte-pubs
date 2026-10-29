@@ -73,7 +73,7 @@ export function consigneNommage(pubs: readonly PubANommer[], connues: readonly s
   ].join('\n');
 }
 
-const CONSIGNE_FAMILLE =
+export const CONSIGNE_FAMILLE =
   '- "famille": the generic product TYPE in English, 1 to 3 words, lowercase, singular, without size, colour, material or brand ("food blender", "blood pressure monitor", "perfume", "wig", "ebook", "online course"). Two ads for the same kind of product MUST get exactly the same famille.';
 
 /** Une famille propre : minuscules, lettres et espaces, 1 à 4 mots, 40 caractères. */

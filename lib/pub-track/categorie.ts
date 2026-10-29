@@ -16,12 +16,34 @@ import type { Destination } from './destination';
 import type { Niche } from './niches';
 import { estPlateformeDigitale } from './technologie';
 
-const CATEGORIES_PUB = ['physique', 'digital', 'service', 'application', 'divertissement', 'hors_cible'] as const;
+const CATEGORIES_PUB = ['physique', 'digital', 'saas', 'service', 'application', 'divertissement', 'hors_cible'] as const;
 export type CategoriePub = (typeof CATEGORIES_PUB)[number];
 
-/** Les seules catégories que la grille montre, chacune dans son onglet. */
-export const CATEGORIES_VISIBLES = ['physique', 'digital'] as const satisfies readonly CategoriePub[];
+/**
+ * Les seules catégories que la grille montre, chacune dans son onglet, JAMAIS mêlées : les trois types
+ * de produit (plan v2, section 2.3). `saas` (logiciel ou application vendu en abonnement, lot 3) n'est
+ * posé que par le classeur IA : les règles de ce fichier ne le devinent pas, elles le CONTRÔLENT
+ * (`categorieAvecClasseur`). C'est la seule liste : filtres, écran, Molia et MCP la lisent ici.
+ */
+export const CATEGORIES_VISIBLES = ['physique', 'digital', 'saas'] as const satisfies readonly CategoriePub[];
 export type CategorieVisible = (typeof CATEGORIES_VISIBLES)[number];
+
+export function estCategorieVisible(v: unknown): v is CategorieVisible {
+  return typeof v === 'string' && (CATEGORIES_VISIBLES as readonly string[]).includes(v);
+}
+
+/**
+ * Le type posé par le classeur IA (lot 3), contrôlé par les règles. Les règles ont le dernier mot sur ce
+ * qui n'est PAS un produit vendu en Afrique (application grand public, divertissement, hors cible) : le
+ * modèle voit l'image, pas le vendeur. Il a le dernier mot sur le TYPE d'un produit : physique, digital,
+ * et SaaS, qu'aucune règle ne sait reconnaître (un logiciel en abonnement passait pour « digital »,
+ * « service » ou « application »).
+ */
+export function categorieAvecClasseur(regles: CategoriePub, typeIa: string | null | undefined, vend: boolean | null | undefined): CategoriePub {
+  if (vend === false || !estCategorieVisible(typeIa)) return regles;
+  if (typeIa === 'saas') return regles === 'digital' || regles === 'service' || regles === 'application' || regles === 'saas' ? 'saas' : regles;
+  return estCategorieVisible(regles) ? typeIa : regles;
+}
 
 export interface EntreeCategorie {
   texte: string;

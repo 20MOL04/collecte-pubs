@@ -25,7 +25,7 @@ interface Ligne {
   miniature_chemin: string;
 }
 
-async function image(base: string, chemin: string): Promise<string | null> {
+export async function image(base: string, chemin: string): Promise<string | null> {
   try {
     const res = await fetch(`${base}/storage/v1/object/public/pub-track/${chemin}`, { signal: AbortSignal.timeout(20_000) });
     if (!res.ok) return null;
@@ -45,7 +45,7 @@ const COTE_MIN_DECOUPE = 180;
  * `produits/<id>.webp`. Rend null quand la découpe serait trop petite : le kit n'enverra pas une
  * vignette illisible, il préférera ne rien envoyer.
  */
-async function recadrerProduit(sb: SupabaseClient, base: string, chemin: string, cadre: Cadre, id: string): Promise<string | null> {
+export async function recadrerProduit(sb: SupabaseClient, base: string, chemin: string, cadre: Cadre, id: string): Promise<string | null> {
   try {
     const res = await fetch(`${base}/storage/v1/object/public/pub-track/${chemin}`, { signal: AbortSignal.timeout(20_000) });
     if (!res.ok) return null;
@@ -68,7 +68,7 @@ async function recadrerProduit(sb: SupabaseClient, base: string, chemin: string,
   }
 }
 
-interface Compteur {
+export interface Compteur {
   coutUsd: number;
   jetonsEntree: number;
   jetonsSortie: number;
@@ -78,7 +78,7 @@ interface Compteur {
  * UN appel au modèle, compté. 'arret' : clé refusée ou quota (inutile d'insister cette nuit) ;
  * 'echec' : pas de réponse exploitable ; sinon le JSON lu, ou null s'il est illisible (payé quand même).
  */
-async function appelerGemini(cle: string, modele: string, parts: Record<string, unknown>[], compteur: Compteur): Promise<'arret' | 'echec' | { json: unknown }> {
+export async function appelerGemini(cle: string, modele: string, parts: Record<string, unknown>[], compteur: Compteur): Promise<'arret' | 'echec' | { json: unknown }> {
   try {
     const res = await fetch(`${ENDPOINT}/${encodeURIComponent(modele)}:generateContent`, {
       method: 'POST',
@@ -115,7 +115,7 @@ async function appelerGemini(cle: string, modele: string, parts: Record<string, 
 }
 
 /** Les familles déjà rangées, les plus fréquentes d'abord : le modèle les réutilise plutôt qu'en inventer. */
-async function famillesConnues(sb: SupabaseClient, max = 150): Promise<string[]> {
+export async function famillesConnues(sb: SupabaseClient, max = 150): Promise<string[]> {
   const { data } = await sb.from('pub_track_pubs').select('produit_famille').not('produit_famille', 'is', null).limit(10_000);
   const n = new Map<string, number>();
   for (const r of (data ?? []) as { produit_famille: string }[]) n.set(r.produit_famille, (n.get(r.produit_famille) ?? 0) + 1);
