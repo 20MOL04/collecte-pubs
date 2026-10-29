@@ -8,6 +8,7 @@ import type { Destination } from './destination';
 import type { Langue } from './langue';
 import type { Niche } from './niches';
 import type { Technologie } from './technologie';
+import { SEUILS_PUB, type StatutPub } from './score';
 
 export const SOURCES_PUB = ['meta', 'tiktok'] as const;
 export type SourcePub = (typeof SOURCES_PUB)[number];
@@ -29,20 +30,27 @@ export const PUBS_GRATUITES = 8;
 export const PUBS_VERROUILLEES = 4;
 
 /**
- * La page « Gagnantes » (10/10/2026, sur le modèle du « Top Trend » d'AfriSpy) : les pubs africaines
- * au score d'au moins 50, classées par score. Sans abonnement : les 3 premières, puis des lignes
- * floutées FACTICES (aucune donnée réelle n'est envoyée au navigateur).
+ * La page « Gagnantes » (10/10/2026, sur le modèle du « Top Trend » d'AfriSpy), classée par score. Sans
+ * abonnement : les 3 premières, puis des lignes floutées FACTICES (aucune donnée réelle n'est envoyée au
+ * navigateur). Depuis le lot 4 de la v2 (29/10/2026), une gagnante est une pub PROUVÉE : le statut est
+ * calculé chaque nuit (`statutPub`, score.ts) et rangé en base (`statut_pt`, migration 118). Le seuil vient
+ * de `SEUILS_PUB`, jamais recopié.
  */
-export const SCORE_GAGNANTE = 50;
+export const SCORE_GAGNANTE = SEUILS_PUB.gagnante.scoreMin;
 /**
  * Ce qui entre dans « Gagnantes » (15/10/2026) : des PRODUITS PHYSIQUES africains, la meilleure
  * carte de chaque annonceur, et un même texte publié par plusieurs pages une seule fois. Mesure sur la vraie base : les guides de MELBO STORE et de Digital
  * Commerce Place (score 84 à 88) tenaient le haut, et Gadgets shop y avait six cartes. Le digital
  * a son onglet dans la grille (`type=digital`), les services n'entrent nulle part.
  */
-export const FILTRE_GAGNANTES = { marche: 'afrique', categorie: 'physique', rang_annonceur: 1, rang_texte: 1 } as const;
+export const FILTRE_GAGNANTES = { statut_pt: 'gagnante', marche: 'afrique', categorie: 'physique', rang_annonceur: 1, rang_texte: 1 } as const;
 export const GAGNANTES_GRATUITES = 3;
 export const GAGNANTES_FLOUTEES = 8;
+
+/** La carte d'une pub qui entre dans « Gagnantes » se distingue dans la grille : le statut rangé en base, une seule règle. */
+export function estGagnante(pub: Pick<PubTrack, 'active' | 'statut'>): boolean {
+  return pub.active && pub.statut === 'gagnante';
+}
 
 export interface PubTrack {
   id: string;
@@ -77,6 +85,14 @@ export interface PubTrack {
   variantes: number;
   score: number;
   scorePhrase: string;
+  /** Lot 4 : gagnante, montante, nouvelle, ou null (statut prouvé, calculé chaque nuit). */
+  statut: StatutPub | null;
+  /** Lot 2 : la dernière vérification de la page annonceur, ou null si jamais vérifiée. */
+  verifieeLe: string | null;
+  /** Lot 3 : la qualité créative de 1 à 5 jugée par le classeur, ou null. */
+  qualiteCreative: number | null;
+  /** Lot 4 : pages qui publient le même texte ou le même visuel (un réseau), 1 si la page est seule. */
+  reseauPages: number;
   /** Le prix lu dans le texte, ramené en FCFA (lib/pub-track/offre.ts), ou null. */
   prixFcfa: number | null;
   /** Le nom du produit vu sur l image par le modèle de vision (086), ou null tant qu il n est pas nommé. */

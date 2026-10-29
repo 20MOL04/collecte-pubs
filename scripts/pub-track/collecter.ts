@@ -47,7 +47,7 @@ import { schemaTikTokConnu, versLigneTikTok } from './analyser-tiktok';
 import { schemaVideoTikTokConnu, versLigneVideoTikTok } from './analyser-tiktok-videos';
 import { nommerProduits } from './nommer-produits';
 import { requetesOccident } from '../../lib/pub-track/occident';
-import { phraseScore, scorePub } from '../../lib/pub-track/score';
+import { scoresDeNuit, type PubAScorer } from '../../lib/pub-track/score-nuit';
 import { analyserPage, technologieDepuisDomaine, technologieDepuisUrl, technologieSansSite } from '../../lib/pub-track/technologie';
 import { CATEGORIES_VISIBLES, categorieAvecClasseur, categorieOccident, categoriePub, vendeursAncres, type CategoriePub, type EntreeCategorie } from '../../lib/pub-track/categorie';
 import { clesProduit } from '../../lib/pub-track/produit-cle';
@@ -395,35 +395,50 @@ async function recalculer(sb: SupabaseClient): Promise<void> {
   await etapeRecalcul('historique', () => sb.rpc('pub_track_recalculer_historique', { p_jour: jour }));
 }
 
+/**
+ * Le score v2 de TOUTES les pubs actives, sa phrase et son statut prouvé (lot 4, lib/pub-track/score-nuit.ts).
+ * Sans la migration 116 (pas de `verifiee_le`), aucune preuve : aucune pub ne passe gagnante. Sans la 118,
+ * le score et la phrase passent par l'ancienne porte, sans statut.
+ */
 async function recalculerScores(sb: SupabaseClient): Promise<number> {
-  const groupes = new Map(
+  const variantesGroupe = new Map(
     (await toutLire<{ groupe_cle: string; variantes: number }>((de, a) => sb.from('pub_track_groupes').select('groupe_cle, variantes').range(de, a))).map((g) => [g.groupe_cle, g.variantes]),
   );
-  const boutiques = new Map(
-    (await toutLire<{ cle: string; pubs_actives: number; variation_7j: number | null }>((de, a) => sb.from('pub_track_boutiques').select('cle, pubs_actives, variation_7j').range(de, a))).map(
-      (b) => [b.cle, b],
-    ),
+  const croissanceBoutique = new Map(
+    (await toutLire<{ cle: string; variation_7j: number | null }>((de, a) => sb.from('pub_track_boutiques').select('cle, variation_7j').range(de, a))).map((b) => [b.cle, b.variation_7j]),
   );
-  const pubs = await toutLire<{ id: string; jours_actifs: number; groupe_cle: string | null; variantes_source: number; boutique_cle: string | null; reseaux: string[] }>((de, a) =>
-    sb.from('pub_track_pubs').select('id, jours_actifs, groupe_cle, variantes_source, boutique_cle, reseaux').eq('active', true).order('id').range(de, a),
+  const croissanceAnnonceur = new Map(
+    (await toutLire<{ source: string; page_id: string; variation_7j: number | null }>((de, a) => sb.from('pub_track_annonceurs').select('source, page_id, variation_7j').range(de, a))).map((x) => [
+      `${x.source}:${x.page_id}`,
+      x.variation_7j,
+    ]),
   );
-  const scores = pubs.map((p) => {
-    const b = p.boutique_cle ? boutiques.get(p.boutique_cle) : undefined;
-    const signaux = {
-      joursActifs: p.jours_actifs,
-      variantes: (p.groupe_cle && groupes.get(p.groupe_cle)) || p.variantes_source,
-      pubsActivesBoutique: b?.pubs_actives ?? 1,
-      croissance7j: b?.variation_7j ?? null,
-      reseaux: Math.max(1, p.reseaux.length),
-    };
-    return { id: p.id, score: scorePub(signaux), phrase: phraseScore(signaux) };
+  const colonnesScore = 'id, source, jours_actifs, groupe_cle, variantes_source, boutique_cle, annonceur_id, categorie, marche, produit_famille, pays, prix_fcfa, offres, date_debut';
+  const lirePubs = (c: string) => toutLire<PubAScorer>((de, a) => sb.from('pub_track_pubs').select(c).eq('active', true).order('id').range(de, a));
+  const pubs = await lirePubs(`${colonnesScore}, verifiee_le`).catch((err: Error) => {
+    if (!colonneAbsente(err.message)) throw err;
+    return lirePubs(colonnesScore);
   });
+  const scores = scoresDeNuit(pubs, { variantesGroupe, croissanceBoutique, croissanceAnnonceur }, new Date());
   let poses = 0;
+  let v2 = true;
   for (let i = 0; i < scores.length; i += 1000) {
-    const { data, error } = await sb.rpc('pub_track_poser_scores', { p_scores: scores.slice(i, i + 1000) });
+    const lot = scores.slice(i, i + 1000);
+    if (v2) {
+      const { data, error } = await sb.rpc('pub_track_poser_scores_v2', { p_scores: lot });
+      if (!error) {
+        poses += Number(data) || 0;
+        continue;
+      }
+      console.error(`scores v2 : ${error.message} ; repli sur l ancienne porte, sans statut`);
+      v2 = false;
+    }
+    const { data, error } = await sb.rpc('pub_track_poser_scores', { p_scores: lot.map(({ id, score, phrase }) => ({ id, score, phrase })) });
     if (error) throw new Error(`scores : ${error.message}`);
     poses += Number(data) || 0;
   }
+  const statuts = scores.reduce((n, x) => ({ ...n, [x.statut ?? 'aucun']: (n[x.statut ?? 'aucun'] ?? 0) + 1 }), {} as Record<string, number>);
+  console.log(`Scores v2 : ${scores.length} pubs actives, ${statuts.gagnante ?? 0} gagnantes, ${statuts.montante ?? 0} montantes, ${statuts.nouvelle ?? 0} nouvelles.`);
   return poses;
 }
 
