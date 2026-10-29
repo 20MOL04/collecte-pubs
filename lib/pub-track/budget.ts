@@ -1,7 +1,7 @@
 /**
  * Le budget d'une nuit de collecte Pub Track : le SEUL endroit où il se règle.
  *
- * GitHub Actions donne 2 000 minutes par mois à un dépôt privé, et l'équipe
+ * GitHub Actions donne 2 000 minutes par mois à un dépôt privé, et le équipe
  * ne veut RIEN payer (décision du 07/10/2026). Une nuit tient donc en moins
  * d'une heure : 44 minutes de collecte, ~6 de rangement (plateformes, classement,
  * scores) et ~4 d'installation, soit ~54 minutes et ~1 650 minutes par mois, avec de la marge pour les autres workflows du dépôt.
@@ -36,23 +36,15 @@ export const BUDGET_COLLECTE = {
   technosParNuit: 300,
   /**
    * Une recherche sur DEUX ne demande à Meta que les pubs lancées depuis N jours :
-   * les lancements du jour arrivent dès la nuit suivante (demande de l'équipe,
+   * les lancements du jour arrivent dès la nuit suivante (demande du équipe,
    * 07/10/2026 : « voir les publicités lancées aujourd'hui »). L'autre moitié
    * prend toutes les pubs actives, pour les gagnantes installées depuis longtemps.
    */
   fraicheurJours: 2,
   /**
-   * TikTok (« Top Ads » du Creative Center, 09/10/2026) : ses meilleures pubs couvrent 30 jours
-   * et bougent lentement. Une passe tous les 3 jours, 8 minutes prises sur Meta cette nuit-là :
-   * le total du mois ne bouge pas.
-   */
-  tiktokTousLesNJours: 3,
-  tiktokMinutes: 8,
-  /** Pages de 20 pubs lues par pays (TikTok en montre rarement plus de 20 pour un pays africain). */
-  tiktokPagesParPays: 2,
-  /**
    * Vidéos TikTok des vendeurs (ScrapeCreators, 1 crédit la recherche, 09/10/2026) : 60 recherches
-   * par nuit au plus, 2 par pays, 6 minutes prises sur Meta. 5 000 crédits tiennent ~80 nuits.
+   * par nuit au plus, 2 par pays, 6 minutes prises sur Meta. 5 000 crédits tiennent ~80 nuits. PAYANT : ne part
+   * qu'avec `--tiktok-videos` et une clé posée (lot 7), jamais par défaut.
    */
   tiktokVideosParNuit: 60,
   tiktokVideosParPays: 2,
