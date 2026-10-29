@@ -1,0 +1,35 @@
+name: Classeur IA
+# Pub Track v2, lot 3 (29/10/2026) : le vrai nom du produit, son type (physique, digital, saas) et la qualite
+# de la pub, lus sur l'image par un modele de vision. Tache A PART de la collecte : aucun navigateur, aucune
+# lecture Meta, son propre groupe. Elle passe apres le dernier creneau de la nuit (04 h 37).
+#
+# GRATUIT (decision de l'equipe : aucun budget) : GEMINI_API_KEY doit venir d'un projet Google AI Studio
+# SANS facturation. La tache respecte la limite gratuite (une requete toutes les 7 s) et s'arrete au premier
+# refus de quota ; elle reprend la nuit suivante. Sans cle, elle ne fait rien.
+on:
+  schedule:
+    - cron: "47 5 * * *"
+  workflow_dispatch:
+concurrency:
+  group: classeur
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  classer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Classer
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CLASSEUR_GRATUIT: oui
+        run: npx tsx scripts/pub-track/classer-produits.ts

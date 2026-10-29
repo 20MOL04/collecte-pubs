@@ -18,7 +18,7 @@ export type FormatPub = (typeof FORMATS_PUB)[number];
 export const RESEAUX = ['facebook', 'instagram', 'messenger', 'audience_network', 'whatsapp', 'threads', 'tiktok'] as const;
 export type Reseau = (typeof RESEAUX)[number];
 
-export type TypeProduit = 'physique' | 'digital';
+export type TypeProduit = import('./categorie').CategorieVisible;
 
 /** Sans abonnement, le vendeur voit ce nombre de pubs ; le reste est verrouillé (décision du 07/10/2026). */
 /**

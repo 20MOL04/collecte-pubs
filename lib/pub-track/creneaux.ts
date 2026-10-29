@@ -85,7 +85,8 @@ export const cleOccident = (pays: string) => `occident:${pays}`;
 
 /* ── Le journal : statut, verrou, saut de nuit ──────────────────────────────────────── */
 
-export const STATUTS_CRENEAU = ['en_cours', 'ok', 'bloque', 'schema', 'erreur', 'saute', 'occupe'] as const;
+/** `hors_meta` : une tâche de la nuit qui ne parle pas à Meta (le classeur IA, lot 3). Ni verrou, ni tentative. */
+export const STATUTS_CRENEAU = ['en_cours', 'ok', 'bloque', 'schema', 'erreur', 'saute', 'occupe', 'hors_meta'] as const;
 export type StatutCreneau = (typeof STATUTS_CRENEAU)[number];
 
 /** Un créneau qui a vraiment parlé à Meta. Sauté ou refusé par le verrou : non. */

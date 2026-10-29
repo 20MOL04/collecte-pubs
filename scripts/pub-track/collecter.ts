@@ -49,7 +49,7 @@ import { nommerProduits } from './nommer-produits';
 import { requetesOccident } from '../../lib/pub-track/occident';
 import { phraseScore, scorePub } from '../../lib/pub-track/score';
 import { analyserPage, technologieDepuisDomaine, technologieDepuisUrl, technologieSansSite } from '../../lib/pub-track/technologie';
-import { CATEGORIES_VISIBLES, categorieOccident, categoriePub, vendeursAncres, type CategoriePub, type EntreeCategorie } from '../../lib/pub-track/categorie';
+import { CATEGORIES_VISIBLES, categorieAvecClasseur, categorieOccident, categoriePub, vendeursAncres, type CategoriePub, type EntreeCategorie } from '../../lib/pub-track/categorie';
 import { clesProduit } from '../../lib/pub-track/produit-cle';
 import { offresDe, prixFcfa } from '../../lib/pub-track/offre';
 import { estDestination } from '../../lib/pub-track/destination';
@@ -299,8 +299,13 @@ async function toutLire<T>(lire: (de: number, a: number) => PromiseLike<{ data: 
  */
 async function classerBase(sb: SupabaseClient): Promise<number> {
   const colonnes =
-    'id, source, marche, categorie, annonceur_id, annonceur_nom, texte, titre, appel_action, lien, domaine, destination, boutique_cle, langue, produit_famille';
-  const lignes = await toutLire<Record<string, string | null>>((de, a) => sb.from('pub_track_pubs').select(colonnes).order('id').range(de, a));
+    'id, source, marche, categorie, annonceur_id, annonceur_nom, texte, titre, appel_action, lien, domaine, destination, boutique_cle, langue, produit_famille, verdict_ia';
+  const lire = (c: string) => toutLire<Record<string, string | null>>((de, a) => sb.from('pub_track_pubs').select(c).order('id').range(de, a));
+  // Le type vu par le classeur IA (117) : sans la migration, les règles seules décident, comme avant.
+  const lignes = await lire(`${colonnes}, type_ia`).catch((err: Error) => {
+    if (!colonneAbsente(err.message)) throw err;
+    return lire(colonnes);
+  });
   const technos = new Map(
     (await toutLire<{ cle: string; technologie: string }>((de, a) => sb.from('pub_track_boutiques').select('cle, technologie').range(de, a))).map((b) => [
       b.cle,
@@ -324,7 +329,12 @@ async function classerBase(sb: SupabaseClient): Promise<number> {
   const afrique = lignes.filter((l) => l.source === 'meta' && l.marche !== 'occident');
   // Le vendeur se juge sur TOUTES ses pubs (audit du 08/10/2026).
   const ancres = vendeursAncres(afrique.map((l) => ({ annonceurId: l.annonceur_id, entree: entree(l) })));
+  const vend = (l: Record<string, string | null>) => (l.verdict_ia === 'produit' ? true : l.verdict_ia === 'pas_produit' ? false : null);
   const categorie = (l: Record<string, string | null>): string | null => {
+    const regles = categorieRegles(l);
+    return regles ? categorieAvecClasseur(regles as CategoriePub, l.type_ia, vend(l)) : regles;
+  };
+  const categorieRegles = (l: Record<string, string | null>): string | null => {
     if (l.marche === 'occident') {
       return categorieOccident({
         texte: l.texte ?? '',
