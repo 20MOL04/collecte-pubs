@@ -1,5 +1,5 @@
 /**
- * La « Tendance occidentale » de Pub Track (décision de l'équipe, 10/10/2026) : Pub Track reste
+ * La « Tendance occidentale » de Pub Track (décision du équipe, 10/10/2026) : Pub Track reste
  * 100 % Afrique, mais le robot lit aussi quelques pays occidentaux. Leurs pubs portent
  * `marche = 'occident'` (migration 093) et ne se voient qu'avec le filtre premium du même nom.
  *
@@ -47,4 +47,48 @@ export function requetesOccident(jour: Date, n: number): { pays: string; mot: st
 
 export function paysOccident(code: string): PaysOccident | null {
   return PAYS_OCCIDENT.find((p) => p.code === code.toUpperCase()) ?? null;
+}
+
+/** Un produit africain qui gagne ou qui monte cette semaine : la matière des recherches orientées (lot 6). */
+export interface ProduitAOrienter {
+  /** Le nom en français (classeur IA). */
+  nom: string | null;
+  /** La recherche fournisseur en anglais (classeur IA). */
+  recherche: string | null;
+}
+
+const motsCourts = (v: string | null, max: number) =>
+  (v ?? '')
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((m) => m.length > 1)
+    .slice(0, max)
+    .join(' ')
+    .toLowerCase();
+
+/**
+ * Les recherches occidentales de la nuit, ORIENTÉES (plan v2, lot 6) : la moitié cherche en Occident les produits
+ * africains qui gagnent ou montent cette semaine (le nom français dans les pays francophones, la recherche anglaise
+ * ailleurs), pour dire au vendeur « déjà en test en Afrique » ; l'autre moitié garde la rotation des mots de vente,
+ * pour trouver ce qui n'est pas encore arrivé (« pas encore en Afrique »). Sans produit à orienter : la rotation seule.
+ * Déterministe pour un jour et une liste donnés.
+ */
+export function requetesOccidentOrientees(produits: readonly ProduitAOrienter[], jour: Date, n: number): { pays: string; mot: string }[] {
+  if (n <= 0) return [];
+  const orientees: { pays: string; mot: string }[] = [];
+  const vues = new Set<string>();
+  const jourN = Math.floor(jour.getTime() / 86_400_000);
+  const ordrePays = PAYS_OCCIDENT.filter((p) => p.langue !== 'pt');
+  produits.forEach((p, i) => {
+    const pays = ordrePays[(jourN + i) % ordrePays.length]!;
+    const mot = pays.langue === 'fr' ? motsCourts(p.nom, 4) || motsCourts(p.recherche, 4) : motsCourts(p.recherche, 4) || motsCourts(p.nom, 4);
+    const cle = `${pays.code}|${mot}`;
+    if (mot.split(' ').length < 2 || vues.has(cle)) return;
+    vues.add(cle);
+    orientees.push({ pays: pays.code, mot });
+  });
+  const partOrientee = Math.min(orientees.length, Math.ceil(n / 2));
+  const rotation = requetesOccident(jour, n).filter((r) => !vues.has(`${r.pays}|${r.mot}`));
+  return [...orientees.slice(0, partOrientee), ...rotation].slice(0, n);
 }

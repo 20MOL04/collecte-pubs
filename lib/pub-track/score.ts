@@ -44,6 +44,8 @@ export const SEUILS_PUB = {
   gagnante: { scoreMin: 60, joursVerifiesMin: 14, preuveMaxJours: 3, variantesMin: 2, vendeursMin: 2 },
   montante: { lanceeMinJours: 7, lanceeMaxJours: 21, preuveMaxJours: 3 },
   nouvelle: { lanceeMaxJours: 7 },
+  /** Tendance occidentale (plan, section 2.4) : promise aux abonnés, elle doit être irréprochable. */
+  occident: { joursVerifiesMin: 14, variantesMin: 3, vendeursMin: 2, preuveMaxJours: 3 },
 } as const;
 
 export const STATUTS_PUB = ['gagnante', 'montante', 'nouvelle'] as const;
@@ -108,6 +110,18 @@ export function statutPub(e: {
     return 'montante';
   }
   return null;
+}
+
+/**
+ * Une pub occidentale montrée aux abonnés (lot 6) : produit PHYSIQUE, active vérifiée il y a moins de 3 jours, et
+ * soit 14 jours prouvés avec au moins 3 variantes, soit plusieurs annonceurs sur le même produit. Le reste est lu et
+ * gardé, jamais présenté comme une tendance.
+ */
+export function occidentProuve(e: { categorie: string | null; signaux: SignauxScore }): boolean {
+  const o = SEUILS_PUB.occident;
+  const s = e.signaux;
+  if (e.categorie !== 'physique' || s.preuveJours === null || s.preuveJours > o.preuveMaxJours) return false;
+  return (s.joursVerifies >= o.joursVerifiesMin && s.variantes >= o.variantesMin) || s.vendeursProduit >= o.vendeursMin;
 }
 
 export function enHausse(variation7j: number | null): boolean {

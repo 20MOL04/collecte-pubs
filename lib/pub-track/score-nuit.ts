@@ -8,7 +8,7 @@
  * Verrou : verify-score-v2.
  */
 import { estOffre, type Offre } from './offre';
-import { phraseScore, scorePub, statutPub, type SignauxScore, type StatutPub } from './score';
+import { occidentProuve, phraseScore, scorePub, statutPub, type SignauxScore, type StatutPub } from './score';
 
 export interface PubAScorer {
   id: string;
@@ -33,6 +33,8 @@ export interface ScoreDeNuit {
   score: number;
   phrase: string;
   statut: StatutPub | null;
+  /** Lot 6 : une pub occidentale prouvée (tendance premium) ; null pour une pub africaine. */
+  occident: boolean | null;
 }
 
 const JOUR = 86_400_000;
@@ -81,6 +83,7 @@ export function scoresDeNuit(
       score,
       phrase: phraseScore(signaux),
       statut: statutPub({ active: true, categorie: p.categorie, marche: p.marche, joursDepuisLancement, score, signaux }),
+      occident: p.marche === 'occident' ? occidentProuve({ categorie: p.categorie, signaux }) : null,
     };
   });
 }

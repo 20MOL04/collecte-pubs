@@ -46,7 +46,7 @@ import { estPaysPubTrack, paysDuJour, PAYS_PUB_TRACK } from '../../lib/pub-track
 import { schemaTikTokConnu, versLigneTikTok } from './analyser-tiktok';
 import { schemaVideoTikTokConnu, versLigneVideoTikTok } from './analyser-tiktok-videos';
 import { nommerProduits } from './nommer-produits';
-import { requetesOccident } from '../../lib/pub-track/occident';
+import { requetesOccidentOrientees, type ProduitAOrienter } from '../../lib/pub-track/occident';
 import { scoresDeNuit, type PubAScorer } from '../../lib/pub-track/score-nuit';
 import { analyserPage, technologieDepuisDomaine, technologieDepuisUrl, technologieSansSite } from '../../lib/pub-track/technologie';
 import { CATEGORIES_VISIBLES, categorieAvecClasseur, categorieOccident, categoriePub, vendeursAncres, type CategoriePub, type EntreeCategorie } from '../../lib/pub-track/categorie';
@@ -218,7 +218,7 @@ async function lirePage(url: string): Promise<{ html: string; adresse: string } 
 }
 
 /**
- * Sur quoi vend cette boutique. Décision de l'équipe du 07/10/2026 : on lit
+ * Sur quoi vend cette boutique. Décision du équipe du 07/10/2026 : on lit
  * LA PAGE DE VENTE de la pub (son lien), pas seulement l'accueil du domaine,
  * parce qu'un vendeur digital monte souvent sa page sur son propre domaine et
  * branche un bouton de paiement Chariow, Maketou ou Selar. Dans l'ordre :
@@ -917,6 +917,25 @@ async function fermerJournal(sb: SupabaseClient, id: string, champs: Record<stri
   if (repli.error) console.error(`journal : ${repli.error.message}`);
 }
 
+/**
+ * Les produits africains qui gagnent ou qui montent cette semaine (lot 6) : la matière des recherches occidentales
+ * orientées. Sans la migration 118 (pas de statut), une liste vide : la rotation seule, comme avant.
+ */
+async function produitsAOrienter(sb: SupabaseClient): Promise<ProduitAOrienter[]> {
+  const { data, error } = await sb
+    .from('pub_track_pubs')
+    .select('produit_nom, produit_recherche')
+    .in('statut_pt', ['gagnante', 'montante'])
+    .eq('marche', 'afrique')
+    .eq('categorie', 'physique')
+    .eq('active', true)
+    .not('produit_recherche', 'is', null)
+    .order('score', { ascending: false })
+    .limit(40);
+  if (error) return [];
+  return ((data ?? []) as { produit_nom: string | null; produit_recherche: string | null }[]).map((l) => ({ nom: l.produit_nom, recherche: l.produit_recherche }));
+}
+
 /** Le créneau en cours, pour fermer sa ligne même quand la nuit s'arrête sur une panne. */
 let journalOuvert: { sb: SupabaseClient; id: string; nuit: string; creneau: number } | null = null;
 
@@ -1142,7 +1161,8 @@ async function main(): Promise<void> {
           const d = memoire.get(cleOccident(po))?.get(mot)?.derniere;
           return !!d && Date.parse(d) >= depuisNuit.getTime();
         };
-        for (const { pays: po, mot } of requetesOccident(jourDeNuit(nuit), BUDGET_COLLECTE.occidentRequetes)) {
+        const orientees = requetesOccidentOrientees(await produitsAOrienter(sb), jourDeNuit(nuit), BUDGET_COLLECTE.occidentRequetes);
+        for (const { pays: po, mot } of orientees) {
           if (Date.now() > fin) break;
           if (faitesOccident(po, mot)) continue;
           if (!(await chercherOccident(po, mot))) {
@@ -1163,7 +1183,7 @@ async function main(): Promise<void> {
       }
       if (sb && statut === 'ok') {
         const finOccident = Date.now() + BUDGET_COLLECTE.occidentMinutes * 60_000;
-        for (const { pays: po, mot } of requetesOccident(new Date(), BUDGET_COLLECTE.occidentRequetes)) {
+        for (const { pays: po, mot } of requetesOccidentOrientees(await produitsAOrienter(sb), new Date(), BUDGET_COLLECTE.occidentRequetes)) {
           if (Date.now() > finOccident) break;
           if (!(await chercherOccident(po, mot))) break;
         }

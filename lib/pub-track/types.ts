@@ -23,7 +23,7 @@ export type TypeProduit = import('./categorie').CategorieVisible;
 
 /** Sans abonnement, le vendeur voit ce nombre de pubs ; le reste est verrouillé (décision du 07/10/2026). */
 /**
- * Sans abonnement (décision de l'équipe, 10/10/2026) : 8 pubs, soit deux rangées, puis UNE rangée
+ * Sans abonnement (décision du équipe, 10/10/2026) : 8 pubs, soit deux rangées, puis UNE rangée
  * de cartes verrouillées, puis le bandeau d'abonnement. Avant : 10 pubs et jusqu'à 12 cadenas.
  */
 export const PUBS_GRATUITES = 8;
@@ -93,6 +93,12 @@ export interface PubTrack {
   qualiteCreative: number | null;
   /** Lot 4 : pages qui publient le même texte ou le même visuel (un réseau), 1 si la page est seule. */
   reseauPages: number;
+  /** Le type générique du produit posé par le classeur IA (088), la clé « un produit » entre vendeurs. */
+  famille: string | null;
+  /** Lot 6, pubs occidentales seulement : le même produit est-il déjà vendu en Afrique ? */
+  pont: 'deja_en_test' | 'pas_encore' | null;
+  /** Les leviers d'offre lus dans le texte : paiement à la livraison, livraison gratuite, promo, lot (081). */
+  offres: import('./offre').Offre[];
   /** Le prix lu dans le texte, ramené en FCFA (lib/pub-track/offre.ts), ou null. */
   prixFcfa: number | null;
   /** Le nom du produit vu sur l image par le modèle de vision (086), ou null tant qu il n est pas nommé. */
