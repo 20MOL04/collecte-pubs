@@ -1,12 +1,21 @@
 name: Collecte de nuit
 # Collecte de nuit des pubs publiques. Depot public : minutes GitHub Actions gratuites et illimitees.
+#
+# Pub Track v2, lot 1 (29/10/2026) : la nuit en QUATRE CRENEAUX COURTS au lieu d'une heure d'affilee.
+# Le 29/10, Meta a repondu 403 des la premiere recherche et la nuit a lu 0 pub. Chaque creneau lit Meta
+# ~15 minutes sur une machine neuve, puis s'arrete ; le suivant reprend la file de la nuit (memoire des
+# recherches). Minutes decalees, jamais a l'heure pile : GitHub retarde les crons pleins (le cron de
+# 01 h 00 partait entre 06 h 08 et 06 h 55).
 on:
   schedule:
-    - cron: "0 1 * * *"
+    - cron: "7 21 * * *"
+    - cron: "37 23 * * *"
+    - cron: "7 2 * * *"
+    - cron: "37 4 * * *"
   workflow_dispatch:
     inputs:
       pays:
-        description: "Pays (ex. CI,SN,CM). Vide = ceux du jour."
+        description: "Pays (ex. CI,SN,CM). Vide = un creneau de la nuit, qui reprend la file."
         required: false
       mots:
         description: "Mots-cles (ex. savon,creme). Vide = la rotation."
@@ -17,14 +26,15 @@ on:
       mots_par_pays:
         description: "Mots-cles par pays (ex. 12). Vide = le budget de nuit."
         required: false
+# UN SEUL groupe pour tout le depot : jamais deux navigateurs vers Meta en meme temps, creneaux et
+# lancements a la main confondus. La ligne de journal en base fait le meme verrou entre les depots.
 concurrency:
-  # Un groupe par liste de pays : plusieurs rattrapages tournent en parallele, sur des pays differents.
-  group: collecte-${{ github.event.inputs.pays || 'nuit' }}
+  group: collecte-meta
   cancel-in-progress: false
 jobs:
   collecter:
     runs-on: ubuntu-latest
-    # Depot public : minutes gratuites et illimitees. Une nuit ~54 min.
+    # Un creneau ~25 min (installation, ~15 de Meta, rangement) ; un lancement a la main par pays jusqu'a 58.
     timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
@@ -46,8 +56,10 @@ jobs:
           DEPUIS: ${{ github.event.inputs.depuis }}
           MOTS_PAR_PAYS: ${{ github.event.inputs.mots_par_pays }}
         # Aucune depense : ni Gemini (nommage) ni ScrapeCreators (TikTok). Seules les pubs Meta, gratuites.
+        # Sans pays ni mots (cron, ou lancement a la main vide) : un creneau de la nuit.
         run: |
           ARGS="--sans-tiktok"
+          if [ -z "$PAYS" ] && [ -z "$MOTS" ]; then ARGS="$ARGS --creneau"; fi
           if [ -n "$PAYS" ]; then ARGS="$ARGS --pays $PAYS"; fi
           if [ -n "$MOTS" ]; then ARGS="$ARGS --mots $MOTS"; fi
           if [ -n "$DEPUIS" ]; then ARGS="$ARGS --depuis $DEPUIS"; fi

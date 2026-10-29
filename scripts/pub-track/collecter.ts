@@ -24,6 +24,27 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import sharp from 'sharp';
 
 import { BUDGET_COLLECTE } from '../../lib/pub-track/budget';
+import {
+  CRENEAUX,
+  PROFIL_NAVIGATEUR,
+  agentOrdinaire,
+  cleNuit,
+  cleOccident,
+  debutNuit,
+  doitSauter,
+  faitesDepuis,
+  gagneLeVerrou,
+  jourDeNuit,
+  ligneAnnotation,
+  mesures,
+  pasDefilement,
+  pauseHumaine,
+  pauseLongue,
+  rangCreneau,
+  resteAfrique,
+  type LigneJournal,
+  type StatutCreneau,
+} from '../../lib/pub-track/creneaux';
 import { choisirRequetes, type StatRequete } from '../../lib/pub-track/requetes';
 import { estPaysPubTrack, paysDuJour, PAYS_PUB_TRACK } from '../../lib/pub-track/pays';
 import { schemaTikTokConnu, versLigneTikTok } from './analyser-tiktok';
@@ -55,8 +76,18 @@ function arg(nom: string): string | null {
   return i >= 0 ? (process.argv[i + 1] ?? '') : null;
 }
 const sec = process.argv.includes('--sec');
-const pause = ([min, max]: readonly [number, number]) =>
-  new Promise((r) => setTimeout(r, min + Math.random() * (max - min)));
+/** `--creneau` : un créneau de la nuit (cron de `collecte.yml`), qui reprend la file là où le précédent s'est arrêté. */
+const MODE_CRENEAU = process.argv.includes('--creneau');
+const dormir = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const pause = (intervalle: readonly [number, number]) => dormir(pauseHumaine(intervalle, Math.random));
+
+/** Un défilement à la vitesse d'une main : petits coups de molette, courtes hésitations entre eux. */
+async function defiler(page: { mouse: { wheel(x: number, y: number): Promise<void> } }): Promise<void> {
+  for (const pas of pasDefilement(6000, Math.random)) {
+    await page.mouse.wheel(0, pas);
+    await pause([180, 700]);
+  }
+}
 /**
  * TikTok passe tous les N jours (ses « Top Ads » couvrent 30 jours et bougent lentement), ou sur
  * demande. Cette nuit-là, Meta lui cède ses minutes : la nuit entière tient dans le quota gratuit.
@@ -136,8 +167,9 @@ async function lireRequete(
     // Mesuré le 07/10/2026 après ~60 recherches dans l'après-midi : Meta répond 403 avec une
     // page SANS aucune pub. Continuer, c'est enchaîner des recherches vides et creuser le blocage.
     if (reponse?.status() === 403 && !html.includes('ad_archive_id')) throw new Bloque('403 sans aucune pub : Meta freine cette adresse');
+    if (reponse?.status() === 429) throw new Bloque('429 : trop de demandes pour cette adresse');
     for (let i = 0; i < defilements; i++) {
-      await page.mouse.wheel(0, 6000);
+      await defiler(page);
       await pause(BUDGET_COLLECTE.pauseDefilementMs);
     }
     const lire = async () => {
@@ -153,7 +185,7 @@ async function lireRequete(
       const utiles = lignes.filter((l) => (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie)).length;
       if (lignes.length < BUDGET_COLLECTE.pubsParDefilement * (defilements + i) || utiles * 2 < lignes.length) break;
       const avant = new Set(lignes.map((l) => l.id_source)).size;
-      await page.mouse.wheel(0, 6000);
+      await defiler(page);
       await pause(BUDGET_COLLECTE.pauseDefilementMs);
       lignes = await lire();
       if (new Set(lignes.map((l) => l.id_source)).size <= avant) break;
@@ -397,7 +429,7 @@ async function recalculerScores(sb: SupabaseClient): Promise<number> {
  * pubs de la nuit : le 07/10/2026, aucune collecte n'était allée au bout, et
  * les 195 boutiques étaient « sur mesure », un sous-domaine myshopify compris.
  */
-async function poserTechnologies(sb: SupabaseClient, relireTout = false): Promise<number> {
+async function poserTechnologies(sb: SupabaseClient, relireTout = false, max: number = BUDGET_COLLECTE.technosParNuit): Promise<number> {
   const limite = new Date(Date.now() - BUDGET_COLLECTE.technoValableJours * 86_400_000).toISOString();
   const boutiques = await toutLire<{ cle: string; destination: string; technologie: string; techno_lue_le: string | null }>((de, a) =>
     sb.from('pub_track_boutiques').select('cle, destination, technologie, techno_lue_le').order('cle').range(de, a),
@@ -424,7 +456,7 @@ async function poserTechnologies(sb: SupabaseClient, relireTout = false): Promis
   // Six sites à la fois : 800 lectures à 8 s chacune dureraient sinon près de deux heures.
   const aLire = boutiques
     .filter((b) => b.destination === 'boutique' && !b.cle.startsWith('wa:') && (relireTout || !b.techno_lue_le || b.techno_lue_le < limite))
-    .slice(0, BUDGET_COLLECTE.technosParNuit);
+    .slice(0, max);
   for (let i = 0; i < aLire.length; i += 6) {
     await Promise.all(
       aLire.slice(i, i + 6).map(async (b) => {
@@ -663,8 +695,9 @@ async function rafraichirVideosMeta(
   sb: SupabaseClient,
   avecMiniature: Set<string>,
   budget: { miniatures: number },
+  finImposee: number | null = null,
 ): Promise<{ annonceurs: number; pubs: number }> {
-  const fin = Date.now() + BUDGET_COLLECTE.rafraichirMinutes * 60_000;
+  const fin = finImposee ?? Date.now() + BUDGET_COLLECTE.rafraichirMinutes * 60_000;
   const { data, error } = await sb
     .from('pub_track_vitrine')
     .select('annonceur_id, pays')
@@ -695,6 +728,46 @@ async function rafraichirVideosMeta(
   return sortie;
 }
 
+/* ── Le journal de la nuit : verrou, saut, mesures (lot 1 de Pub Track v2) ─────────────────── */
+
+/** Tant que la migration 115 n'est pas appliquée, ses colonnes n'existent pas : on range les mesures dans le message. */
+const colonneAbsente = (m: string) => /column|colonne|schema cache|PGRST204/i.test(m);
+
+async function ouvrirJournal(sb: SupabaseClient, message: string, nuit: string): Promise<string> {
+  const plein = await sb.from('pub_track_collectes').insert({ message, nuit, statut: 'en_cours' }).select('id').single();
+  if (!plein.error) return (plein.data as { id: string }).id;
+  if (!colonneAbsente(plein.error.message)) throw new Error(`journal : ${plein.error.message}`);
+  const repli = await sb.from('pub_track_collectes').insert({ message }).select('id').single();
+  if (repli.error) throw new Error(`journal : ${repli.error.message}`);
+  return (repli.data as { id: string }).id;
+}
+
+async function lireJournal(sb: SupabaseClient): Promise<LigneJournal[]> {
+  const plein = await sb.from('pub_track_collectes').select('id, debut, fin, message, statut, nuit').order('debut', { ascending: false }).limit(40);
+  if (!plein.error) return (plein.data ?? []) as LigneJournal[];
+  if (!colonneAbsente(plein.error.message)) throw new Error(`journal : ${plein.error.message}`);
+  const repli = await sb.from('pub_track_collectes').select('id, debut, fin, message').order('debut', { ascending: false }).limit(40);
+  if (repli.error) throw new Error(`journal : ${repli.error.message}`);
+  return (repli.data ?? []) as LigneJournal[];
+}
+
+async function fermerJournal(sb: SupabaseClient, id: string, champs: Record<string, unknown>, m: ReturnType<typeof mesures>): Promise<void> {
+  const fin = new Date().toISOString();
+  const { nuit, creneau, statut, minutes_meta, pubs_par_minute, bloque_a } = m;
+  const plein = await sb.from('pub_track_collectes').update({ ...champs, nuit, creneau, statut, minutes_meta, pubs_par_minute, bloque_a, fin }).eq('id', id);
+  if (!plein.error) return;
+  if (!colonneAbsente(plein.error.message)) {
+    console.error(`journal : ${plein.error.message}`);
+    return;
+  }
+  const message = `${String(champs.message ?? '').slice(0, 300)} | ${JSON.stringify(m)}`;
+  const repli = await sb.from('pub_track_collectes').update({ ...champs, message, fin }).eq('id', id);
+  if (repli.error) console.error(`journal : ${repli.error.message}`);
+}
+
+/** Le créneau en cours, pour fermer sa ligne même quand la nuit s'arrête sur une panne. */
+let journalOuvert: { sb: SupabaseClient; id: string; nuit: string; creneau: number } | null = null;
+
 async function main(): Promise<void> {
   const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const cle = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -713,7 +786,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  const aujourdhui = new Date();
+  const nuit = cleNuit(new Date());
+  // Tous les créneaux d'une nuit lisent les mêmes pays et les mêmes recherches occidentales.
+  const aujourdhui = MODE_CRENEAU ? jourDeNuit(nuit) : new Date();
   const pays = (arg('pays')?.split(',').map((p) => p.trim().toUpperCase()).filter(estPaysPubTrack)) ?? paysDuJour(aujourdhui).map((p) => p.code);
   const motsImposes = arg('mots')?.split(',').map((m) => m.trim()).filter(Boolean) ?? null;
   const motsParPays = Number(arg('mots-par-pays')) || Math.max(1, Math.floor(BUDGET_COLLECTE.requetesParNuit / Math.max(1, pays.length)));
@@ -721,11 +796,30 @@ async function main(): Promise<void> {
   const joursDepuis = Number(arg('depuis'));
   const depuisImpose = Number.isInteger(joursDepuis) && joursDepuis > 0 && joursDepuis <= 90 ? ilYAJours(joursDepuis) : null;
 
-  let journalId: string | null = null;
+  // LE VERROU ET LE SAUT DE NUIT, AVANT TOUT NAVIGATEUR. Une seule collecte Meta à la fois, quel que
+  // soit le dépôt qui la lance ; après deux blocages de suite, Meta n'est pas rouvert avant une nuit.
+  let creneau = 1;
   if (sb) {
-    const { data } = await sb.from('pub_track_collectes').insert({ message: `pays ${pays.join(',')}` }).select('id').single();
-    journalId = (data as { id?: string } | null)?.id ?? null;
+    const id = await ouvrirJournal(sb, MODE_CRENEAU ? `creneau nuit ${nuit}` : `pays ${pays.join(',')}`, nuit);
+    const lignes = await lireJournal(sb);
+    creneau = rangCreneau(lignes, nuit, id, new Date());
+    const fermerSans = async (statut: StatutCreneau, texte: string) => {
+      const m = mesures({ nuit, creneau, statut, recherches: 0, pubsLues: 0, msMeta: 0, bloqueA: null });
+      await fermerJournal(sb, id, { message: texte }, m);
+      console.log(texte);
+      console.log(ligneAnnotation(m));
+    };
+    if (!gagneLeVerrou(lignes, id, new Date())) {
+      await fermerSans('occupe', 'une autre collecte Meta tourne deja : ce creneau ne s ouvre pas');
+      return;
+    }
+    if (doitSauter(lignes, nuit, new Date()) && !process.argv.includes('--forcer')) {
+      await fermerSans('saute', `deux blocages Meta de suite : nuit ${nuit} sautee`);
+      return;
+    }
+    journalOuvert = { sb, id, nuit, creneau };
   }
+
   const stats = {
     requetes: 0,
     pubs_lues: 0,
@@ -739,14 +833,28 @@ async function main(): Promise<void> {
     nommage_jetons_sortie: 0,
     nommage_cout_usd: 0,
   };
+  // Écrits par `arreter`, une fermeture : sans l'annotation large, TypeScript croirait le statut toujours « ok ».
+  let statut = 'ok' as StatutCreneau;
+  let bloqueA = null as number | null;
 
   const nomPaquet = 'playwright';
   const { chromium } = await import(nomPaquet);
-  const navigateur = await chromium.launch({ headless: true });
-  const contexte = await navigateur.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
+  // UN NAVIGATEUR ORDINAIRE (lot 1) : sans tête, Chromium se déclare « HeadlessChrome » et signale
+  // l'automatisation. Langue, fuseau et en-tête d'une seule personne ; un écran tiré parmi les courants.
+  const navigateur = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
+  const sonde = await navigateur.newPage();
+  const agent = agentOrdinaire(String(await sonde.evaluate(() => navigator.userAgent)));
+  await sonde.close();
+  const contexte = await navigateur.newContext({
+    locale: PROFIL_NAVIGATEUR.locale,
+    timezoneId: PROFIL_NAVIGATEUR.timezoneId,
+    userAgent: agent,
+    viewport: PROFIL_NAVIGATEUR.ecrans[Math.floor(Math.random() * PROFIL_NAVIGATEUR.ecrans.length)],
+    extraHTTPHeaders: { 'Accept-Language': PROFIL_NAVIGATEUR.acceptLanguage },
+  });
   const vues = new Map<string, LignePub>();
   const avecMiniature = new Set<string>();
-  const budgetMiniatures = { miniatures: BUDGET_COLLECTE.miniaturesParNuit };
+  const budgetMiniatures = { miniatures: Math.floor(BUDGET_COLLECTE.miniaturesParNuit / (MODE_CRENEAU ? CRENEAUX.parNuit : 1)) };
   let miniatures = 0;
 
   // La mémoire des recherches (migration 083) : ce que chaque (pays, recherche) a déjà rapporté.
@@ -762,97 +870,173 @@ async function main(): Promise<void> {
     }
   }
 
-  try {
-    tour: for (const p of process.argv.includes('--tiktok-seul') || process.argv.includes('--videos-seul') || process.argv.includes('--rafraichir-seul') ? [] : pays) {
-      const mots = motsImposes ?? choisirRequetes(p, memoire.get(p) ?? new Map(), aujourdhui, motsParPays);
-      for (const [rang, mot] of mots.entries()) {
-        if (tempsEcoule() || stats.requetes >= BUDGET_COLLECTE.requetesParNuit) break tour;
-        stats.requetes += 1;
-        try {
-          // `--depuis N` : tout lire sur N jours (rattrapage). Sinon, une recherche sur deux ne prend que les lancements récents.
-          const depuis = depuisImpose ?? (rang % 2 === 0 ? ilYAJours(BUDGET_COLLECTE.fraicheurJours) : null);
-          const lignes = await lireRequete(contexte, p, mot, defilements, depuis);
-          stats.pubs_lues += lignes.length;
-          const touchees: LignePub[] = [];
-          for (const l of lignes) {
-            const deja = vues.get(l.id_source);
-            const fusion = { ...(deja ? fusionner(deja, l) : l), requete: `${p} · ${mot}` };
-            vues.set(l.id_source, fusion);
-            touchees.push(fusion);
-          }
-          const utiles = lignes.filter((l) => (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie)).length;
-          if (sb) {
-            const { error } = await sb.rpc('pub_track_compter_requete', { p_pays: p, p_requete: mot, p_pubs: lignes.length, p_utiles: utiles });
-            if (error) console.error(`memoire des recherches : ${error.message}`);
-          }
-          // Sauvé tout de suite, images comprises : une panne en fin de nuit ne perd pas ce qui est déjà lu.
-          if (sb && touchees.length) {
-            const ecrit = await ecrireRecherche(sb, touchees, avecMiniature, budgetMiniatures);
-            stats.pubs_nouvelles += ecrit.nouvelles;
-            miniatures += ecrit.miniatures;
-          }
-          console.log(`${p} « ${mot} »${depuis ? ` depuis le ${depuis}` : ''} : ${lignes.length} pubs, ${utiles} utiles (total ${vues.size})`);
-        } catch (err) {
-          stats.erreurs += 1;
-          if (err instanceof SchemaChange) {
-            stats.empreinte_schema = err.message;
-            stats.message = 'format Meta change : collecte arretee, analyser-reponse.ts a mettre a jour';
-            console.error(stats.message, err.message);
-            break tour;
-          }
-          if (err instanceof Bloque) {
-            stats.message = `bloque par Meta : ${err.message}`;
-            console.error(stats.message);
-            break tour;
-          }
-          console.error(`${p} « ${mot} » : echec`, err instanceof Error ? err.message : err);
-        }
-        await pause(BUDGET_COLLECTE.pauseRequeteMs);
-      }
+  /** Un arrêt Meta : le format a changé, ou l'adresse est freinée. Le reste du créneau ne touche plus Meta. */
+  const arreter = (err: unknown): boolean => {
+    if (err instanceof SchemaChange) {
+      statut = 'schema';
+      stats.empreinte_schema = err.message;
+      stats.message = 'format Meta change : collecte arretee, analyser-reponse.ts a mettre a jour';
+      console.error(stats.message, err.message);
+      return true;
     }
-    // « Tendance occidentale » (10/10/2026) : quelques recherches dans des pays occidentaux, après l'Afrique.
-    if (sb && !stats.message && !process.argv.includes('--tiktok-seul') && !process.argv.includes('--videos-seul') && !process.argv.includes('--rafraichir-seul')) {
-      const finOccident = Date.now() + BUDGET_COLLECTE.occidentMinutes * 60_000;
-      for (const { pays: po, mot } of requetesOccident(new Date(), BUDGET_COLLECTE.occidentRequetes)) {
-        if (Date.now() > finOccident) break;
-        try {
-          const lues = await lireRequete(contexte, po, mot, defilements, null);
-          const lignes = lues.map((l) => ({
-            ...l,
-            marche: 'occident' as const,
-            requete: `occident:${po} · ${mot}`,
-            // Enseignes, banques, crédit, immobilier, services : écartés dès la lecture (15/10/2026). Le reste
-            // attend le jugement du modèle de vision ; `classerBase` rejoue la règle chaque nuit avec la famille.
-            categorie: categorieOccident({ texte: l.texte, titre: l.titre, domaine: l.domaine, lien: l.lien, annonceur: l.annonceur_nom, categorieLue: l.categorie }),
-          }));
-          stats.pubs_lues += lignes.length;
-          if (lignes.length) {
-            const ecrit = await ecrireRecherche(sb, lignes, avecMiniature, budgetMiniatures);
-            stats.pubs_nouvelles += ecrit.nouvelles;
-            miniatures += ecrit.miniatures;
+    if (err instanceof Bloque) {
+      statut = 'bloque';
+      bloqueA = stats.requetes;
+      stats.message = `bloque par Meta : ${err.message}`;
+      console.error(stats.message);
+      return true;
+    }
+    return false;
+  };
+
+  /** Une recherche africaine, écrite tout de suite. `false` : Meta a dit stop. */
+  const chercherAfrique = async (p: string, mot: string, rang: number): Promise<boolean> => {
+    stats.requetes += 1;
+    try {
+      // `--depuis N` : tout lire sur N jours (rattrapage). Sinon, une recherche sur deux ne prend que les lancements récents.
+      const depuis = depuisImpose ?? (rang % 2 === 0 ? ilYAJours(BUDGET_COLLECTE.fraicheurJours) : null);
+      const lignes = await lireRequete(contexte, p, mot, defilements, depuis);
+      stats.pubs_lues += lignes.length;
+      const touchees: LignePub[] = [];
+      for (const l of lignes) {
+        const deja = vues.get(l.id_source);
+        const fusion = { ...(deja ? fusionner(deja, l) : l), requete: `${p} · ${mot}` };
+        vues.set(l.id_source, fusion);
+        touchees.push(fusion);
+      }
+      const utiles = lignes.filter((l) => (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie)).length;
+      if (sb) {
+        const { error } = await sb.rpc('pub_track_compter_requete', { p_pays: p, p_requete: mot, p_pubs: lignes.length, p_utiles: utiles });
+        if (error) console.error(`memoire des recherches : ${error.message}`);
+      }
+      // Sauvé tout de suite, images comprises : une panne en fin de nuit ne perd pas ce qui est déjà lu.
+      if (sb && touchees.length) {
+        const ecrit = await ecrireRecherche(sb, touchees, avecMiniature, budgetMiniatures);
+        stats.pubs_nouvelles += ecrit.nouvelles;
+        miniatures += ecrit.miniatures;
+      }
+      console.log(`${p} « ${mot} »${depuis ? ` depuis le ${depuis}` : ''} : ${lignes.length} pubs, ${utiles} utiles (total ${vues.size})`);
+    } catch (err) {
+      stats.erreurs += 1;
+      if (arreter(err)) return false;
+      console.error(`${p} « ${mot} » : echec`, err instanceof Error ? err.message : err);
+    }
+    await pause(BUDGET_COLLECTE.pauseRequeteMs);
+    const longue = pauseLongue(Math.random);
+    if (longue) await dormir(longue);
+    return true;
+  };
+
+  /** Une recherche occidentale (« Tendance occidentale », 10/10/2026). `false` : Meta a dit stop. */
+  const chercherOccident = async (po: string, mot: string): Promise<boolean> => {
+    try {
+      const lues = await lireRequete(contexte, po, mot, defilements, null);
+      const lignes = lues.map((l) => ({
+        ...l,
+        marche: 'occident' as const,
+        requete: `occident:${po} · ${mot}`,
+        // Enseignes, banques, crédit, immobilier, services : écartés dès la lecture (15/10/2026). Le reste
+        // attend le jugement du modèle de vision ; `classerBase` rejoue la règle chaque nuit avec la famille.
+        categorie: categorieOccident({ texte: l.texte, titre: l.titre, domaine: l.domaine, lien: l.lien, annonceur: l.annonceur_nom, categorieLue: l.categorie }),
+      }));
+      stats.pubs_lues += lignes.length;
+      if (sb) {
+        // La mémoire sait ainsi quelles recherches occidentales la nuit a déjà faites (un créneau reprend la suite).
+        await sb.rpc('pub_track_compter_requete', { p_pays: cleOccident(po), p_requete: mot, p_pubs: lignes.length, p_utiles: lignes.length });
+        if (lignes.length) {
+          const ecrit = await ecrireRecherche(sb, lignes, avecMiniature, budgetMiniatures);
+          stats.pubs_nouvelles += ecrit.nouvelles;
+          miniatures += ecrit.miniatures;
+        }
+      }
+      console.log(`Occident ${po} « ${mot} » : ${lignes.length} pubs`);
+    } catch (err) {
+      if (arreter(err)) return false;
+      console.error(`Occident ${po} « ${mot} » : echec`, err instanceof Error ? err.message : err);
+    }
+    await pause(BUDGET_COLLECTE.pauseRequeteMs);
+    return true;
+  };
+
+  const debutMeta = Date.now();
+  let finReelleMeta = debutMeta;
+  const seulementTikTok = process.argv.includes('--tiktok-seul') || process.argv.includes('--videos-seul') || process.argv.includes('--rafraichir-seul');
+  try {
+    if (MODE_CRENEAU) {
+      // LA FILE DE LA NUIT : l'Afrique, puis l'Occident, puis le rafraîchissement des vidéos, dans le
+      // temps du créneau. Ce qui a déjà été cherché depuis le début de la nuit (mémoire des recherches)
+      // est sauté : le créneau suivant reprend exactement là où celui-ci s'arrête, même sur un 403.
+      const fin = debutMeta + CRENEAUX.minutesMeta * 60_000;
+      const depuisNuit = debutNuit(nuit);
+      const dernieres = (cle: string) => new Map([...(memoire.get(cle) ?? new Map<string, StatRequete>()).entries()].map(([r, s]) => [r, s.derniere]));
+      const faites = new Map(pays.map((p) => [p, faitesDepuis(dernieres(p), depuisNuit)]));
+      let actif = true;
+      tour: for (const { pays: p, reste } of resteAfrique(pays, faites, motsParPays)) {
+        const mots = motsImposes ?? choisirRequetes(p, memoire.get(p) ?? new Map(), new Date(), reste);
+        for (const [i, mot] of mots.entries()) {
+          if (Date.now() > fin) break tour;
+          if (!(await chercherAfrique(p, mot, (faites.get(p) ?? 0) + i))) {
+            actif = false;
+            break tour;
           }
-          console.log(`Occident ${po} « ${mot} » : ${lignes.length} pubs`);
-        } catch (err) {
-          if (err instanceof Bloque) {
-            console.error(`Occident : bloque par Meta (${err.message}), on passe`);
+        }
+      }
+      if (sb && actif && Date.now() < fin) {
+        const faitesOccident = (po: string, mot: string) => {
+          const d = memoire.get(cleOccident(po))?.get(mot)?.derniere;
+          return !!d && Date.parse(d) >= depuisNuit.getTime();
+        };
+        for (const { pays: po, mot } of requetesOccident(jourDeNuit(nuit), BUDGET_COLLECTE.occidentRequetes)) {
+          if (Date.now() > fin) break;
+          if (faitesOccident(po, mot)) continue;
+          if (!(await chercherOccident(po, mot))) {
+            actif = false;
             break;
           }
-          console.error(`Occident ${po} « ${mot} » : echec`, err instanceof Error ? err.message : err);
         }
-        await pause(BUDGET_COLLECTE.pauseRequeteMs);
+      }
+      if (sb && actif && Date.now() < fin) {
+        try {
+          const r = await rafraichirVideosMeta(contexte, sb, avecMiniature, budgetMiniatures, fin);
+          console.log(`Videos Meta : ${r.annonceurs} annonceurs relus, ${r.pubs} pubs rafraichies.`);
+        } catch (err) {
+          if (!arreter(err)) {
+            stats.erreurs += 1;
+            console.error('Videos Meta : echec', err instanceof Error ? err.message : err);
+          }
+        }
+      }
+    } else if (!seulementTikTok) {
+      // Le lancement à la main (rattrapage d'un pays, d'un mot) : l'ancienne nuit d'un bloc, sous le même verrou.
+      tour: for (const p of pays) {
+        const mots = motsImposes ?? choisirRequetes(p, memoire.get(p) ?? new Map(), aujourdhui, motsParPays);
+        for (const [rang, mot] of mots.entries()) {
+          if (tempsEcoule() || stats.requetes >= BUDGET_COLLECTE.requetesParNuit) break tour;
+          if (!(await chercherAfrique(p, mot, rang))) break tour;
+        }
+      }
+      if (sb && statut === 'ok') {
+        const finOccident = Date.now() + BUDGET_COLLECTE.occidentMinutes * 60_000;
+        for (const { pays: po, mot } of requetesOccident(new Date(), BUDGET_COLLECTE.occidentRequetes)) {
+          if (Date.now() > finOccident) break;
+          if (!(await chercherOccident(po, mot))) break;
+        }
+      }
+      if (sb && statut === 'ok') {
+        try {
+          const r = await rafraichirVideosMeta(contexte, sb, avecMiniature, budgetMiniatures);
+          console.log(`Videos Meta : ${r.annonceurs} annonceurs relus, ${r.pubs} pubs rafraichies.`);
+        } catch (err) {
+          // Un refus ici n'arrête pas la nuit : TikTok et le nommage passent quand même.
+          if (!arreter(err)) {
+            stats.erreurs += 1;
+            console.error('Videos Meta : echec', err instanceof Error ? err.message : err);
+          }
+        }
       }
     }
-    if (sb && !stats.message) {
-      try {
-        const r = await rafraichirVideosMeta(contexte, sb, avecMiniature, budgetMiniatures);
-        console.log(`Videos Meta : ${r.annonceurs} annonceurs relus, ${r.pubs} pubs rafraichies.`);
-      } catch (err) {
-        // Un refus ici n'arrête pas la nuit : TikTok et le nommage passent quand même.
-        stats.erreurs += 1;
-        console.error('Videos Meta : echec', err instanceof Error ? err.message : err);
-      }
-    }
-    if (VIDEOS_TIKTOK && !stats.message) {
+    finReelleMeta = Date.now();
+    if (VIDEOS_TIKTOK && statut === 'ok') {
       try {
         // Les pays du jour (ou `--pays`) : les vidéos des vendeurs bougent vite, on les relit chaque nuit.
         const tv = await collecterVideosTikTok(sb, pays, memoire, avecMiniature, budgetMiniatures);
@@ -865,7 +1049,7 @@ async function main(): Promise<void> {
         console.error('TikTok videos : echec', err instanceof Error ? err.message : err);
       }
     }
-    if (NUIT_TIKTOK && !stats.message) {
+    if (NUIT_TIKTOK && statut === 'ok') {
       try {
         // `--pays` restreint aussi TikTok ; sinon les 54 pays, une page de liste coûte moins d'une seconde.
         const tt = await collecterTikTok(navigateur, sb, arg('pays') ? pays : PAYS_PUB_TRACK.map((x) => x.code), avecMiniature, budgetMiniatures);
@@ -881,51 +1065,59 @@ async function main(): Promise<void> {
   } finally {
     await navigateur.close().catch(() => undefined);
   }
+  const pubsMeta = stats.pubs_lues;
+  const m = mesures({ nuit, creneau, statut, recherches: stats.requetes, pubsLues: pubsMeta, msMeta: finReelleMeta - debutMeta, bloqueA });
 
   const lignes = [...vues.values()];
   if (!sb) {
     for (const l of lignes.slice(0, 5)) console.log(JSON.stringify(l, null, 2));
     console.log(`\n--sec : ${lignes.length} pubs lues, rien n'est ecrit.`);
+    console.log(JSON.stringify(m));
     return;
   }
 
-  await classerBase(sb);
-  await recalculer(sb);
-  const technos = await poserTechnologies(sb);
-  // Une boutique reconnue Chariow cette nuit rend ses pubs digitales dès ce matin.
-  await classerBase(sb);
-  await recalculer(sb);
+  // Un créneau qui n'a rien lu (403 dès la première recherche) n'a rien à reclasser : il ne coûte pas un recalcul.
+  let technos = 0;
+  let scores = 0;
+  if (lignes.length || !MODE_CRENEAU) {
+    await classerBase(sb);
+    await recalculer(sb);
+    technos = await poserTechnologies(sb, false, Math.floor(BUDGET_COLLECTE.technosParNuit / (MODE_CRENEAU ? CRENEAUX.parNuit : 1)));
+    // Une boutique reconnue Chariow cette nuit rend ses pubs digitales dès ce matin.
+    await classerBase(sb);
+    await recalculer(sb);
 
-  // LE RATTRAPAGE DES IMAGES (audit du 08/10/2026 : 292 pubs de produits sans image, donc absentes
-  // de la vitrine). La miniature ne se copie qu'à la lecture, et seulement pour une pub déjà classée
-  // produit ; celles que le classement de fin de nuit reconnaît (vendeur jugé à la majorité,
-  // boutique Chariow) n'en avaient pas. Leur adresse d'aperçu n'existe qu'en mémoire, cette nuit.
-  const sansImage: { id_source: string }[] = [];
-  const idsNuit = lignes.filter((l) => l.apercu_source && !avecMiniature.has(l.id_source)).map((l) => l.id_source);
-  for (let i = 0; i < idsNuit.length; i += 300) {
-    const { data } = await sb
-      .from('pub_track_pubs')
-      .select('id_source')
-      .eq('source', 'meta')
-      .in('categorie', CATEGORIES_VISIBLES as unknown as string[])
-      .is('miniature_chemin', null)
-      .in('id_source', idsNuit.slice(i, i + 300));
-    sansImage.push(...((data ?? []) as { id_source: string }[]));
-  }
-  let rattrapees = 0;
-  for (const { id_source } of sansImage) {
-    if (budgetMiniatures.miniatures <= 0) break;
-    const l = vues.get(id_source);
-    const chemin = l ? await recopierMiniature(sb, l) : null;
-    if (!chemin) continue;
-    budgetMiniatures.miniatures -= 1;
-    const { error } = await sb.from('pub_track_pubs').update({ miniature_chemin: chemin }).eq('source', 'meta').eq('id_source', id_source);
-    if (!error) rattrapees += 1;
-  }
-  miniatures += rattrapees;
-  if (rattrapees) console.log(`${rattrapees} images rattrapees pour des pubs reconnues en fin de nuit.`);
+    // LE RATTRAPAGE DES IMAGES (audit du 08/10/2026 : 292 pubs de produits sans image, donc absentes
+    // de la vitrine). La miniature ne se copie qu'à la lecture, et seulement pour une pub déjà classée
+    // produit ; celles que le classement de fin de nuit reconnaît (vendeur jugé à la majorité,
+    // boutique Chariow) n'en avaient pas. Leur adresse d'aperçu n'existe qu'en mémoire, cette nuit.
+    const sansImage: { id_source: string }[] = [];
+    const idsNuit = lignes.filter((l) => l.apercu_source && !avecMiniature.has(l.id_source)).map((l) => l.id_source);
+    for (let i = 0; i < idsNuit.length; i += 300) {
+      const { data } = await sb
+        .from('pub_track_pubs')
+        .select('id_source')
+        .eq('source', 'meta')
+        .in('categorie', CATEGORIES_VISIBLES as unknown as string[])
+        .is('miniature_chemin', null)
+        .in('id_source', idsNuit.slice(i, i + 300));
+      sansImage.push(...((data ?? []) as { id_source: string }[]));
+    }
+    let rattrapees = 0;
+    for (const { id_source } of sansImage) {
+      if (budgetMiniatures.miniatures <= 0) break;
+      const l = vues.get(id_source);
+      const chemin = l ? await recopierMiniature(sb, l) : null;
+      if (!chemin) continue;
+      budgetMiniatures.miniatures -= 1;
+      const { error } = await sb.from('pub_track_pubs').update({ miniature_chemin: chemin }).eq('source', 'meta').eq('id_source', id_source);
+      if (!error) rattrapees += 1;
+    }
+    miniatures += rattrapees;
+    if (rattrapees) console.log(`${rattrapees} images rattrapees pour des pubs reconnues en fin de nuit.`);
 
-  const scores = await recalculerScores(sb);
+    scores = await recalculerScores(sb);
+  }
 
   if (NOMMAGE) {
     try {
@@ -941,14 +1133,25 @@ async function main(): Promise<void> {
     }
   }
 
-  if (journalId) {
-    await sb.from('pub_track_collectes').update({ ...stats, fin: new Date().toISOString() }).eq('id', journalId);
+  if (journalOuvert) {
+    await fermerJournal(sb, journalOuvert.id, stats, m);
+    journalOuvert = null;
   }
   console.log(`\nOK: ${stats.requetes} requetes, ${lignes.length} pubs, ${stats.pubs_nouvelles} nouvelles, ${miniatures} miniatures, ${technos} technologies, ${scores} scores, ${stats.erreurs} erreurs.`);
-  if (stats.message) process.exitCode = 2;
+  console.log(ligneAnnotation(m));
+  // Un 403 est un état prévu : le créneau s'arrête proprement et le suivant reprend. Seul un
+  // changement de format chez Meta demande une main sur le code, et fait échouer la tâche.
+  if (statut === 'bloque') console.log(`::warning title=Meta a bloque ce creneau::${stats.message.replace(/%/g, '%25')}`);
+  if (statut === 'schema') process.exitCode = 2;
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('collecte Pub Track : echec', err);
+  if (journalOuvert) {
+    const { sb, id, nuit, creneau } = journalOuvert;
+    const m = mesures({ nuit, creneau, statut: 'erreur', recherches: 0, pubsLues: 0, msMeta: 0, bloqueA: null });
+    await fermerJournal(sb, id, { message: `echec : ${err instanceof Error ? err.message : String(err)}`.slice(0, 300) }, m).catch(() => undefined);
+    console.log(ligneAnnotation(m));
+  }
   process.exit(1);
 });
