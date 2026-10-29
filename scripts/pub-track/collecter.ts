@@ -26,8 +26,6 @@ import sharp from 'sharp';
 import { BUDGET_COLLECTE } from '../../lib/pub-track/budget';
 import {
   CRENEAUX,
-  PROFIL_NAVIGATEUR,
-  agentOrdinaire,
   cleNuit,
   cleOccident,
   debutNuit,
@@ -37,9 +35,6 @@ import {
   jourDeNuit,
   ligneAnnotation,
   mesures,
-  pasDefilement,
-  pauseHumaine,
-  pauseLongue,
   rangCreneau,
   resteAfrique,
   type LigneJournal,
@@ -78,16 +73,8 @@ function arg(nom: string): string | null {
 const sec = process.argv.includes('--sec');
 /** `--creneau` : un créneau de la nuit (cron de `collecte.yml`), qui reprend la file là où le précédent s'est arrêté. */
 const MODE_CRENEAU = process.argv.includes('--creneau');
-const dormir = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const pause = (intervalle: readonly [number, number]) => dormir(pauseHumaine(intervalle, Math.random));
-
-/** Un défilement à la vitesse d'une main : petits coups de molette, courtes hésitations entre eux. */
-async function defiler(page: { mouse: { wheel(x: number, y: number): Promise<void> } }): Promise<void> {
-  for (const pas of pasDefilement(6000, Math.random)) {
-    await page.mouse.wheel(0, pas);
-    await pause([180, 700]);
-  }
-}
+const pause = ([min, max]: readonly [number, number]) =>
+  new Promise((r) => setTimeout(r, min + Math.random() * (max - min)));
 /**
  * TikTok passe tous les N jours (ses « Top Ads » couvrent 30 jours et bougent lentement), ou sur
  * demande. Cette nuit-là, Meta lui cède ses minutes : la nuit entière tient dans le quota gratuit.
@@ -169,7 +156,7 @@ async function lireRequete(
     if (reponse?.status() === 403 && !html.includes('ad_archive_id')) throw new Bloque('403 sans aucune pub : Meta freine cette adresse');
     if (reponse?.status() === 429) throw new Bloque('429 : trop de demandes pour cette adresse');
     for (let i = 0; i < defilements; i++) {
-      await defiler(page);
+      await page.mouse.wheel(0, 6000);
       await pause(BUDGET_COLLECTE.pauseDefilementMs);
     }
     const lire = async () => {
@@ -185,7 +172,7 @@ async function lireRequete(
       const utiles = lignes.filter((l) => (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie)).length;
       if (lignes.length < BUDGET_COLLECTE.pubsParDefilement * (defilements + i) || utiles * 2 < lignes.length) break;
       const avant = new Set(lignes.map((l) => l.id_source)).size;
-      await defiler(page);
+      await page.mouse.wheel(0, 6000);
       await pause(BUDGET_COLLECTE.pauseDefilementMs);
       lignes = await lire();
       if (new Set(lignes.map((l) => l.id_source)).size <= avant) break;
@@ -796,8 +783,8 @@ async function main(): Promise<void> {
   const joursDepuis = Number(arg('depuis'));
   const depuisImpose = Number.isInteger(joursDepuis) && joursDepuis > 0 && joursDepuis <= 90 ? ilYAJours(joursDepuis) : null;
 
-  // LE VERROU ET LE SAUT DE NUIT, AVANT TOUT NAVIGATEUR. Une seule collecte Meta à la fois, quel que
-  // soit le dépôt qui la lance ; après deux blocages de suite, Meta n'est pas rouvert avant une nuit.
+  // LE VERROU ET LE SAUT, AVANT TOUT NAVIGATEUR. Une seule collecte Meta à la fois, quel que soit le
+  // dépôt qui la lance ; un refus de Meta arrête la nuit, deux nuits refusées de suite en sautent une.
   let creneau = 1;
   if (sb) {
     const id = await ouvrirJournal(sb, MODE_CRENEAU ? `creneau nuit ${nuit}` : `pays ${pays.join(',')}`, nuit);
@@ -839,19 +826,9 @@ async function main(): Promise<void> {
 
   const nomPaquet = 'playwright';
   const { chromium } = await import(nomPaquet);
-  // UN NAVIGATEUR ORDINAIRE (lot 1) : sans tête, Chromium se déclare « HeadlessChrome » et signale
-  // l'automatisation. Langue, fuseau et en-tête d'une seule personne ; un écran tiré parmi les courants.
-  const navigateur = await chromium.launch({ headless: true, args: ['--disable-blink-features=AutomationControlled'] });
-  const sonde = await navigateur.newPage();
-  const agent = agentOrdinaire(String(await sonde.evaluate(() => navigator.userAgent)));
-  await sonde.close();
-  const contexte = await navigateur.newContext({
-    locale: PROFIL_NAVIGATEUR.locale,
-    timezoneId: PROFIL_NAVIGATEUR.timezoneId,
-    userAgent: agent,
-    viewport: PROFIL_NAVIGATEUR.ecrans[Math.floor(Math.random() * PROFIL_NAVIGATEUR.ecrans.length)],
-    extraHTTPHeaders: { 'Accept-Language': PROFIL_NAVIGATEUR.acceptLanguage },
-  });
+  // Le robot se présente tel qu'il est : aucun déguisement en personne (décision du 29/10/2026).
+  const navigateur = await chromium.launch({ headless: true });
+  const contexte = await navigateur.newContext({ locale: 'fr-FR', viewport: { width: 1280, height: 900 } });
   const vues = new Map<string, LignePub>();
   const avecMiniature = new Set<string>();
   const budgetMiniatures = { miniatures: Math.floor(BUDGET_COLLECTE.miniaturesParNuit / (MODE_CRENEAU ? CRENEAUX.parNuit : 1)) };
@@ -922,8 +899,6 @@ async function main(): Promise<void> {
       console.error(`${p} « ${mot} » : echec`, err instanceof Error ? err.message : err);
     }
     await pause(BUDGET_COLLECTE.pauseRequeteMs);
-    const longue = pauseLongue(Math.random);
-    if (longue) await dormir(longue);
     return true;
   };
 
@@ -965,7 +940,7 @@ async function main(): Promise<void> {
     if (MODE_CRENEAU) {
       // LA FILE DE LA NUIT : l'Afrique, puis l'Occident, puis le rafraîchissement des vidéos, dans le
       // temps du créneau. Ce qui a déjà été cherché depuis le début de la nuit (mémoire des recherches)
-      // est sauté : le créneau suivant reprend exactement là où celui-ci s'arrête, même sur un 403.
+      // est sauté : le créneau suivant reprend là où celui-ci s'est arrêté (jamais après un 403 : voir `doitSauter`).
       const fin = debutMeta + CRENEAUX.minutesMeta * 60_000;
       const depuisNuit = debutNuit(nuit);
       const dernieres = (cle: string) => new Map([...(memoire.get(cle) ?? new Map<string, StatRequete>()).entries()].map(([r, s]) => [r, s.derniere]));
@@ -1139,8 +1114,8 @@ async function main(): Promise<void> {
   }
   console.log(`\nOK: ${stats.requetes} requetes, ${lignes.length} pubs, ${stats.pubs_nouvelles} nouvelles, ${miniatures} miniatures, ${technos} technologies, ${scores} scores, ${stats.erreurs} erreurs.`);
   console.log(ligneAnnotation(m));
-  // Un 403 est un état prévu : le créneau s'arrête proprement et le suivant reprend. Seul un
-  // changement de format chez Meta demande une main sur le code, et fait échouer la tâche.
+  // Un 403 est un refus prévu et respecté : le créneau s'arrête proprement et la nuit s'arrête avec lui.
+  // Seul un changement de format chez Meta demande une main sur le code, et fait échouer la tâche.
   if (statut === 'bloque') console.log(`::warning title=Meta a bloque ce creneau::${stats.message.replace(/%/g, '%25')}`);
   if (statut === 'schema') process.exitCode = 2;
 }

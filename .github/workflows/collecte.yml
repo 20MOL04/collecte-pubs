@@ -3,8 +3,8 @@ name: Collecte de nuit
 #
 # Pub Track v2, lot 1 (29/10/2026) : la nuit en QUATRE CRENEAUX COURTS au lieu d'une heure d'affilee.
 # Le 29/10, Meta a repondu 403 des la premiere recherche et la nuit a lu 0 pub. Chaque creneau lit Meta
-# ~15 minutes sur une machine neuve, puis s'arrete ; le suivant reprend la file de la nuit (memoire des
-# recherches). Minutes decalees, jamais a l'heure pile : GitHub retarde les crons pleins (le cron de
+# ~15 minutes puis s'arrete ; le suivant reprend la file de la nuit (memoire des
+# recherches). Un 403 arrete la nuit entiere : un refus se respecte. Minutes decalees, jamais a l'heure pile : GitHub retarde les crons pleins (le cron de
 # 01 h 00 partait entre 06 h 08 et 06 h 55).
 on:
   schedule:

@@ -1,10 +1,11 @@
 /**
  * LA NUIT EN CRÉNEAUX COURTS (Pub Track v2, lot 1, 29/10/2026 : docs/PLAN-PUB-TRACK-V2.md).
  *
- * Le 29/10/2026, Meta a répondu 403 dès la première recherche et la nuit a lu 0 pub. Une heure
- * d'affilée depuis une seule adresse, c'est le rythme d'un robot. La nuit se coupe donc en
- * créneaux de quelques minutes, chacun sur une machine neuve (donc une adresse neuve), qui
- * reprennent la file de la nuit là où le précédent s'est arrêté.
+ * Le 29/10/2026, Meta a répondu 403 dès la première recherche et la nuit a lu 0 pub. La nuit se
+ * coupe en créneaux de quelques minutes, une seule collecte à la fois, qui reprennent la file de la
+ * nuit là où le précédent s'est arrêté. Un refus de Meta (403, 429) est RESPECTÉ : il arrête la nuit
+ * entière, on ne relance jamais depuis une autre machine pour passer outre, et le robot ne se
+ * déguise pas en personne (décision du 29/10/2026 : contourner un refus d'accès est exclu).
  *
  * Tout est PUR ici, sans réseau ni base : `scripts/verify-collecte-creneaux.ts` l'exécute.
  */
@@ -31,9 +32,6 @@ export const CRENEAUX = {
    * démarré entre 06 h 08 et 06 h 55 du 27 au 29/10/2026. Un créneau en retard reste dans sa nuit.
    */
   decalageNuitHeures: 14,
-  /** Pause longue entre deux recherches : probabilité, et durée en ms. */
-  pauseLongueProba: 0.18,
-  pauseLongueMs: [20_000, 60_000] as const,
 } as const;
 
 const JOUR_MS = 86_400_000;
@@ -148,16 +146,17 @@ export function gagneLeVerrou(lignes: readonly LigneJournal[], moi: string, main
 }
 
 /**
- * Après deux blocages de suite, on saute une nuit. Les créneaux qui ont touché Meta, du plus
- * récent au plus ancien : si les deux derniers ont été bloqués, et que le dernier blocage date de
- * cette nuit ou de la veille, on ne rouvre pas Meta. La nuit d'après, un créneau réessaie ; s'il
- * est bloqué à son tour, on saute encore une nuit. Un mur durable donne donc un essai toutes les
- * deux nuits, jamais une rafale.
+ * Un refus se respecte. Les créneaux qui ont touché Meta, du plus récent au plus ancien :
+ * - le dernier a été bloqué CETTE nuit : les créneaux suivants de la nuit ne rouvrent pas Meta ;
+ * - les deux derniers ont été bloqués et le dernier date de la veille : la nuit entière est sautée.
+ * Un mur durable donne donc un seul essai toutes les deux nuits, jamais une relance immédiate.
  */
 export function doitSauter(lignes: readonly LigneJournal[], nuit: string, maintenant: Date): boolean {
   const tentatives = [...lignes]
     .sort((a, b) => Date.parse(b.debut) - Date.parse(a.debut))
     .filter((l) => A_TOUCHE_META.includes(statutDe(l, maintenant)));
+  const derniereTentative = tentatives[0];
+  if (derniereTentative && statutDe(derniereTentative, maintenant) === 'bloque' && nuitDe(derniereTentative) === nuit) return true;
   const dernieres = tentatives.slice(0, CRENEAUX.blocagesAvantSaut);
   if (dernieres.length < CRENEAUX.blocagesAvantSaut || dernieres.some((l) => statutDe(l, maintenant) !== 'bloque')) return false;
   const derniere = nuitDe(dernieres[0]!);
@@ -169,58 +168,6 @@ export function rangCreneau(lignes: readonly LigneJournal[], nuit: string, moi: 
   const avant = lignes.filter((l) => l.id !== moi && nuitDe(l) === nuit && A_TOUCHE_META.includes(statutDe(l, maintenant)));
   return avant.length + 1;
 }
-
-/* ── Le rythme d'une personne ───────────────────────────────────────────────────────── */
-
-export type Alea = () => number;
-
-/**
- * Une pause dans l'intervalle, plus souvent courte que longue (deux tirages multipliés), au lieu
- * d'une loi uniforme que l'œil d'un filtre reconnaît vite.
- */
-export function pauseHumaine([min, max]: readonly [number, number], alea: Alea): number {
-  return Math.round(min + (max - min) * alea() * (0.4 + 0.6 * alea()));
-}
-
-/** De temps en temps, on lâche l'écran : une pause longue entre deux recherches. */
-export function pauseLongue(alea: Alea): number {
-  if (alea() >= CRENEAUX.pauseLongueProba) return 0;
-  const [min, max] = CRENEAUX.pauseLongueMs;
-  return Math.round(min + (max - min) * alea());
-}
-
-/**
- * Un défilement découpé en petits coups de molette (300 à 1 100 px), au lieu d'un saut de
- * 6 000 px d'un bloc : la même distance, à la vitesse d'une main.
- */
-export function pasDefilement(total: number, alea: Alea): number[] {
-  const pas: number[] = [];
-  let reste = total;
-  while (reste > 0) {
-    const p = Math.min(reste, Math.round(300 + 800 * alea()));
-    pas.push(p);
-    reste -= p;
-  }
-  return pas;
-}
-
-/** Un navigateur sans tête se présente comme « HeadlessChrome » : aucune personne n'en utilise. */
-export function agentOrdinaire(agent: string): string {
-  return agent.replace(/HeadlessChrome/g, 'Chrome').replace(/\s*Headless\b/g, '');
-}
-
-/** Langue, fuseau et en-tête d'une seule personne : le français que lisent les heuristiques de Pub Track. */
-export const PROFIL_NAVIGATEUR = {
-  locale: 'fr-FR',
-  timezoneId: 'Europe/Paris',
-  acceptLanguage: 'fr-FR,fr;q=0.9,en-US;q=0.7,en;q=0.6',
-  ecrans: [
-    { width: 1280, height: 800 },
-    { width: 1366, height: 768 },
-    { width: 1440, height: 900 },
-    { width: 1536, height: 864 },
-  ],
-} as const;
 
 /* ── Les mesures ────────────────────────────────────────────────────────────────────── */
 
