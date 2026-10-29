@@ -41,6 +41,7 @@ import {
   type StatutCreneau,
 } from '../../lib/pub-track/creneaux';
 import { choisirRequetes, type StatRequete } from '../../lib/pub-track/requetes';
+import { VERIFICATION, annonceursAVerifier, pageComplete, verdictPage, type PubCandidate, type PubReperee } from '../../lib/pub-track/verification';
 import { estPaysPubTrack, paysDuJour, PAYS_PUB_TRACK } from '../../lib/pub-track/pays';
 import { schemaTikTokConnu, versLigneTikTok } from './analyser-tiktok';
 import { schemaVideoTikTokConnu, versLigneVideoTikTok } from './analyser-tiktok-videos';
@@ -252,11 +253,17 @@ function colonnes(l: LignePub): Omit<LignePub, 'apercu_source'> & { vu_le: strin
   return { ...reste, vu_le: maintenant, maj_le: maintenant };
 }
 
+/** Colonnes d'une migration peut-être pas encore appliquée (116) : sans elles, on écrit quand même le reste. */
+const COLONNES_RECENTES = ['collation_id'] as const;
+
 async function ecrireParLots(sb: SupabaseClient, lignes: Record<string, unknown>[]): Promise<void> {
   for (let i = 0; i < lignes.length; i += 400) {
-    const { error } = await sb
-      .from('pub_track_pubs')
-      .upsert(lignes.slice(i, i + 400), { onConflict: 'source,id_source', defaultToNull: false });
+    const lot = lignes.slice(i, i + 400);
+    const ecrire = (l: Record<string, unknown>[]) => sb.from('pub_track_pubs').upsert(l, { onConflict: 'source,id_source', defaultToNull: false });
+    let { error } = await ecrire(lot);
+    if (error && colonneAbsente(error.message)) {
+      ({ error } = await ecrire(lot.map((l) => Object.fromEntries(Object.entries(l).filter(([k]) => !(COLONNES_RECENTES as readonly string[]).includes(k))))));
+    }
     if (error) throw new Error(`ecriture pub_track_pubs : ${error.message}`);
   }
 }
@@ -672,6 +679,136 @@ async function collecterVideosTikTok(
   return sortie;
 }
 
+/* ── La passe de vérification (lot 2 de Pub Track v2) ───────────────────────────────────── */
+
+/**
+ * Une page annonceur lue JUSQU'AU BOUT : on défile tant qu'un défilement apporte de nouvelles pubs, sous un
+ * plafond. Tous pays (`ALL`) : une pub active ailleurs que dans le pays d'une recherche reste active.
+ * `complete` faux = la page n'a pas fini de charger, elle ne prouve aucun arrêt.
+ */
+async function lirePageAnnonceur(contexte: { newPage(): Promise<any> }, pageId: string): Promise<{ lignes: LignePub[]; complete: boolean }> {
+  const page = await contexte.newPage();
+  const corps: Promise<string>[] = [];
+  page.on('response', (r: any) => {
+    if (r.url().includes('/api/graphql') && r.request().method() === 'POST') corps.push(r.text().catch(() => ''));
+  });
+  try {
+    const reponse = await page.goto(urlAnnonceur(pageId, 'ALL'), { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    if (/login|checkpoint/.test(page.url())) throw new Bloque(`redirige vers ${page.url()}`);
+    await pause(BUDGET_COLLECTE.pauseDefilementMs);
+    const html = await page.content();
+    if (reponse?.status() === 403 && !html.includes('ad_archive_id')) throw new Bloque('403 sans aucune pub : Meta freine cette adresse');
+    if (reponse?.status() === 429) throw new Bloque('429 : trop de demandes pour cette adresse');
+    const lire = async () => {
+      const textes = await Promise.all(corps);
+      const brutes = [...jsonsDuHtml(html), ...textes.flatMap(lireJsons)].flatMap((j) => trouverPubsBrutes(j));
+      if (!schemaConnu(brutes)) throw new SchemaChange(empreinteSchema(brutes));
+      const uniques = new Map<string, LignePub>();
+      for (const b of brutes) {
+        const l = versLigne(b, 'ALL');
+        if (l && l.annonceur_id === pageId) uniques.set(l.id_source, l);
+      }
+      return [...uniques.values()];
+    };
+    let lignes = await lire();
+    for (let n = 1; n <= VERIFICATION.defilementsMax; n++) {
+      const avant = lignes.length;
+      await page.mouse.wheel(0, 6000);
+      await pause(BUDGET_COLLECTE.pauseDefilementMs);
+      lignes = await lire();
+      if (lignes.length === avant) return { lignes, complete: pageComplete(0, n) };
+    }
+    return { lignes, complete: false };
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Relit les annonceurs qui comptent, score décroissant, jusqu'à `fin`. Chaque page relue : ses pubs sont
+ * écrites (vidéo renouvelée au passage), confirmées, et les absentes d'une page complète arrêtées.
+ * Une pub vue sur la page garde ses pays et son marché connus : la page « tous pays » ne les dit pas.
+ */
+async function verifierAnnonceurs(
+  contexte: { newPage(): Promise<any> },
+  sb: SupabaseClient,
+  fin: number,
+  depuisNuit: Date,
+  avecMiniature: Set<string>,
+  budget: { miniatures: number },
+): Promise<{ annonceurs: number; completes: number; lues: number; confirmees: number; arretees: number; preuves: boolean }> {
+  const sortie = { annonceurs: 0, completes: 0, lues: 0, confirmees: 0, arretees: 0, preuves: true };
+  const lireCandidates = (colonnes: string) =>
+    toutLire<PubCandidate>((de, a) =>
+      sb
+        .from('pub_track_pubs')
+        .select(colonnes)
+        .eq('source', 'meta')
+        .eq('active', true)
+        .in('categorie', CATEGORIES_VISIBLES as unknown as string[])
+        .order('score', { ascending: false })
+        .range(de, a),
+    );
+  const candidates = await lireCandidates('annonceur_id, score, verifiee_le').catch(async (err: Error) => {
+    if (!colonneAbsente(err.message)) throw err;
+    sortie.preuves = false;
+    return lireCandidates('annonceur_id, score');
+  });
+  const ordre = annonceursAVerifier(candidates, depuisNuit, new Date(), VERIFICATION.annonceursParNuit);
+  for (const pageId of ordre) {
+    if (Date.now() > fin) break;
+    const lireActives = (colonnes: string) => sb.from('pub_track_pubs').select(colonnes).eq('source', 'meta').eq('annonceur_id', pageId).eq('active', true).limit(2000);
+    let res = await lireActives('id_source, groupe_cle, collation_id, pays, marche');
+    if (res.error && colonneAbsente(res.error.message)) res = await lireActives('id_source, groupe_cle, pays, marche');
+    if (res.error) throw new Error(`verification ${pageId} : ${res.error.message}`);
+    const actives = (res.data ?? []) as unknown as (PubReperee & { pays: string[] | null; marche: string | null })[];
+    const connues = new Map(actives.map((a) => [a.id_source, a]));
+    const compte = new Map<string, number>();
+    for (const a of actives) for (const p of a.pays ?? []) compte.set(p, (compte.get(p) ?? 0) + 1);
+    const paysAnnonceur = [...compte.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? null;
+    const marcheAnnonceur = actives.some((a) => a.marche === 'occident') ? ('occident' as const) : undefined;
+
+    const { lignes, complete } = await lirePageAnnonceur(contexte, pageId);
+    sortie.annonceurs += 1;
+    if (complete) sortie.completes += 1;
+    sortie.lues += lignes.length;
+    const ecrites = lignes.map((l) => {
+      const c = connues.get(l.id_source);
+      return {
+        ...l,
+        pays: c?.pays?.length ? c.pays : paysAnnonceur ? [paysAnnonceur] : [],
+        ...(c?.marche === 'occident' || (!c && marcheAnnonceur) ? { marche: 'occident' as const } : {}),
+        requete: `verification · ${pageId}`,
+      };
+    });
+    if (ecrites.length) await ecrireRecherche(sb, ecrites, avecMiniature, budget);
+    const verdict = verdictPage({
+      actives: actives.map((a) => ({ id_source: a.id_source, groupe_cle: a.groupe_cle, collation_id: a.collation_id ?? null })),
+      vues: lignes.map((l) => ({ id_source: l.id_source, groupe_cle: l.groupe_cle, collation_id: l.collation_id ?? null })),
+      complete,
+    });
+    if (sortie.preuves) {
+      const { error } = await sb.rpc('pub_track_poser_verification', {
+        p_annonceur: pageId,
+        p_confirmees: verdict.confirmees,
+        p_arretees: verdict.arretees,
+        p_quand: new Date().toISOString(),
+      });
+      if (error) {
+        // Migration 116 pas encore appliquée : la page est écrite (vidéos renouvelées), aucune preuve posée.
+        console.error(`verification : preuves non posees (${error.message})`);
+        sortie.preuves = false;
+      } else {
+        sortie.confirmees += verdict.confirmees.length;
+        sortie.arretees += verdict.arretees.length;
+      }
+    }
+    console.log(`Verification ${pageId} : ${lignes.length} pubs listees${complete ? '' : ' (page coupee)'}, ${verdict.confirmees.length} confirmees, ${verdict.arretees.length} arretees`);
+    await pause(BUDGET_COLLECTE.pauseRequeteMs);
+  }
+  return sortie;
+}
+
 /**
  * Le rafraîchissement des vidéos Meta (09/10/2026) : les pubs de la vitrine lues il y a plus de
  * deux jours ont une adresse vidéo qui meurt bientôt. On relit en priorité les annonceurs qui en
@@ -740,8 +877,11 @@ async function lireJournal(sb: SupabaseClient): Promise<LigneJournal[]> {
 
 async function fermerJournal(sb: SupabaseClient, id: string, champs: Record<string, unknown>, m: ReturnType<typeof mesures>): Promise<void> {
   const fin = new Date().toISOString();
-  const { nuit, creneau, statut, minutes_meta, pubs_par_minute, bloque_a } = m;
-  const plein = await sb.from('pub_track_collectes').update({ ...champs, nuit, creneau, statut, minutes_meta, pubs_par_minute, bloque_a, fin }).eq('id', id);
+  const { nuit, creneau, statut, minutes_meta, pubs_par_minute, bloque_a, annonceurs_verifies, pubs_confirmees, pubs_arretees } = m;
+  const plein = await sb
+    .from('pub_track_collectes')
+    .update({ ...champs, nuit, creneau, statut, minutes_meta, pubs_par_minute, bloque_a, annonceurs_verifies, pubs_confirmees, pubs_arretees, fin })
+    .eq('id', id);
   if (!plein.error) return;
   if (!colonneAbsente(plein.error.message)) {
     console.error(`journal : ${plein.error.message}`);
@@ -822,6 +962,7 @@ async function main(): Promise<void> {
   };
   // Écrits par `arreter`, une fermeture : sans l'annotation large, TypeScript croirait le statut toujours « ok ».
   let statut = 'ok' as StatutCreneau;
+  let verif = { annonceurs: 0, completes: 0, lues: 0, confirmees: 0, arretees: 0, preuves: false };
   let bloqueA = null as number | null;
 
   const nomPaquet = 'playwright';
@@ -943,10 +1084,25 @@ async function main(): Promise<void> {
       // est sauté : le créneau suivant reprend là où celui-ci s'est arrêté (jamais après un 403 : voir `doitSauter`).
       const fin = debutMeta + CRENEAUX.minutesMeta * 60_000;
       const depuisNuit = debutNuit(nuit);
+      // D'ABORD LA PREUVE (lot 2) : relire les annonceurs qui comptent avant de chercher du neuf.
+      let actif = true;
+      if (sb) {
+        try {
+          const v = await verifierAnnonceurs(contexte, sb, Math.min(fin, Date.now() + VERIFICATION.minutesParCreneau * 60_000), depuisNuit, avecMiniature, budgetMiniatures);
+          verif = v;
+          stats.pubs_lues += v.lues;
+          console.log(`Verification : ${v.annonceurs} annonceurs relus (${v.completes} pages completes), ${v.lues} pubs, ${v.confirmees} confirmees, ${v.arretees} arretees${v.preuves ? '' : ', preuves non posees (migration 116 absente)'}.`);
+        } catch (err) {
+          if (arreter(err)) actif = false;
+          else {
+            stats.erreurs += 1;
+            console.error('Verification : echec', err instanceof Error ? err.message : err);
+          }
+        }
+      }
       const dernieres = (cle: string) => new Map([...(memoire.get(cle) ?? new Map<string, StatRequete>()).entries()].map(([r, s]) => [r, s.derniere]));
       const faites = new Map(pays.map((p) => [p, faitesDepuis(dernieres(p), depuisNuit)]));
-      let actif = true;
-      tour: for (const { pays: p, reste } of resteAfrique(pays, faites, motsParPays)) {
+      tour: for (const { pays: p, reste } of actif ? resteAfrique(pays, faites, motsParPays) : []) {
         const mots = motsImposes ?? choisirRequetes(p, memoire.get(p) ?? new Map(), new Date(), reste);
         for (const [i, mot] of mots.entries()) {
           if (Date.now() > fin) break tour;
@@ -970,17 +1126,7 @@ async function main(): Promise<void> {
           }
         }
       }
-      if (sb && actif && Date.now() < fin) {
-        try {
-          const r = await rafraichirVideosMeta(contexte, sb, avecMiniature, budgetMiniatures, fin);
-          console.log(`Videos Meta : ${r.annonceurs} annonceurs relus, ${r.pubs} pubs rafraichies.`);
-        } catch (err) {
-          if (!arreter(err)) {
-            stats.erreurs += 1;
-            console.error('Videos Meta : echec', err instanceof Error ? err.message : err);
-          }
-        }
-      }
+      // Le rafraîchissement des vidéos n'a plus de place à part : relire un annonceur renouvelle ses vidéos.
     } else if (!seulementTikTok) {
       // Le lancement à la main (rattrapage d'un pays, d'un mot) : l'ancienne nuit d'un bloc, sous le même verrou.
       tour: for (const p of pays) {
@@ -1041,7 +1187,18 @@ async function main(): Promise<void> {
     await navigateur.close().catch(() => undefined);
   }
   const pubsMeta = stats.pubs_lues;
-  const m = mesures({ nuit, creneau, statut, recherches: stats.requetes, pubsLues: pubsMeta, msMeta: finReelleMeta - debutMeta, bloqueA });
+  const m = mesures({
+    nuit,
+    creneau,
+    statut,
+    recherches: stats.requetes,
+    pubsLues: pubsMeta,
+    msMeta: finReelleMeta - debutMeta,
+    bloqueA,
+    annonceursVerifies: verif.annonceurs,
+    pubsConfirmees: verif.confirmees,
+    pubsArretees: verif.arretees,
+  });
 
   const lignes = [...vues.values()];
   if (!sb) {

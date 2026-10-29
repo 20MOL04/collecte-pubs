@@ -60,6 +60,11 @@ export interface LignePub {
   date_debut: string | null;
   date_fin: string | null;
   groupe_cle: string | null;
+  /**
+   * Meta seulement : le regroupement de la bibliothèque (« N publicités utilisent ce contenu », 116). Meta
+   * n'en affiche qu'une pub : la passe de vérification ne déclare pas arrêtée une pub cachée derrière une sœur.
+   */
+  collation_id?: string | null;
   variantes_source: number;
   /** Pas une colonne : l'adresse fbcdn de l'aperçu, que le collecteur recopie. */
   apercu_source: string | null;
@@ -237,6 +242,7 @@ export function versLigne(brut: Brut, pays: string): LignePub | null {
     date_debut: dateDepuisUnix(brut.start_date),
     date_fin: brut.is_active === false ? dateDepuisUnix(brut.end_date) : null,
     groupe_cle: groupeCle(texte(String(brut.page_id ?? '')), fichierMedia(video) ?? fichierMedia(apercu), brut.collation_id, id),
+    collation_id: brut.collation_id != null && texte(String(brut.collation_id)) ? texte(String(brut.collation_id)) : null,
     variantes_source: Number.isFinite(collation) && collation > 0 ? Math.round(collation) : 1,
     apercu_source: apercu,
     // Les abonnés de la page (10/10/2026) : la bibliothèque les donne avec chaque pub, on les jetait.

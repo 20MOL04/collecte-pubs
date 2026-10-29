@@ -11,8 +11,12 @@
  */
 
 export const CRENEAUX = {
-  /** Créneaux planifiés par nuit (crons de `collecte.yml`). */
-  parNuit: 4,
+  /**
+   * Créneaux planifiés par nuit (crons de `collecte.yml`). Six depuis le lot 2 : la vérification relit
+   * au moins 150 annonceurs par nuit (environ une heure), en plus des recherches. Une seule collecte à la
+   * fois reste la règle : six créneaux courts, jamais deux en même temps.
+   */
+  parNuit: 6,
   /**
    * Minutes de lecture Meta d'un créneau, toutes tâches comprises (le plan dit 10 à 15). La nuit du
    * 28/10/2026 a fait 62 recherches en 44 minutes (~42 s chacune) pour 1 106 pubs ; le rythme humain
@@ -181,6 +185,10 @@ export interface MesuresCreneau {
   pubs_par_minute: number;
   /** Rang de la recherche qui a pris le 403, ou null. */
   bloque_a: number | null;
+  /** Lot 2 : annonceurs relus, pubs confirmées actives, pubs prouvées arrêtées. */
+  annonceurs_verifies: number;
+  pubs_confirmees: number;
+  pubs_arretees: number;
 }
 
 export function mesures(entree: {
@@ -191,6 +199,9 @@ export function mesures(entree: {
   pubsLues: number;
   msMeta: number;
   bloqueA: number | null;
+  annonceursVerifies?: number;
+  pubsConfirmees?: number;
+  pubsArretees?: number;
 }): MesuresCreneau {
   const minutes = Math.round((entree.msMeta / 60_000) * 10) / 10;
   return {
@@ -202,6 +213,9 @@ export function mesures(entree: {
     minutes_meta: minutes,
     pubs_par_minute: minutes > 0 ? Math.round((entree.pubsLues / minutes) * 10) / 10 : 0,
     bloque_a: entree.bloqueA,
+    annonceurs_verifies: entree.annonceursVerifies ?? 0,
+    pubs_confirmees: entree.pubsConfirmees ?? 0,
+    pubs_arretees: entree.pubsArretees ?? 0,
   };
 }
 
@@ -236,6 +250,8 @@ export interface BilanNuit {
   minutes_meta: number;
   pubs_par_minute: number;
   taux_blocage: number;
+  annonceurs_verifies: number;
+  pubs_arretees: number;
   /** Aucun créneau arrêté sur 403, aucun saut, et assez de pubs. */
   reussie: boolean;
 }
@@ -260,6 +276,8 @@ export function bilanNuits(toutes: readonly MesuresCreneau[]): BilanNuit[] {
         minutes_meta: minutes,
         pubs_par_minute: minutes > 0 ? Math.round((pubs / minutes) * 10) / 10 : 0,
         taux_blocage: tentes.length ? Math.round((bloques / tentes.length) * 100) / 100 : 0,
+        annonceurs_verifies: ms.reduce((s, m) => s + (m.annonceurs_verifies ?? 0), 0),
+        pubs_arretees: ms.reduce((s, m) => s + (m.pubs_arretees ?? 0), 0),
         reussie: bloques === 0 && sautes === 0 && pubs >= PUBS_MIN_PAR_NUIT,
       };
     });
