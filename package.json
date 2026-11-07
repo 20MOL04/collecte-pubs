@@ -3,7 +3,9 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "collecter": "tsx scripts/pub-track/collecter.ts"
+    "collecter": "tsx scripts/pub-track/collecter.ts",
+    "test": "tsx --test tests/*.test.ts",
+    "collecter-source": "tsx scripts/pub-track/collecter-source.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "2.112.3",

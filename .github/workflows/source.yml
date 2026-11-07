@@ -1,0 +1,61 @@
+name: Source autorisee
+# La collecte par une source AUTORISEE (07/11/2026) : un fournisseur de donnees sous contrat choisi par Martin
+# (docs/SOURCE-AUTORISEE.md). Aucun navigateur, aucune lecture de la bibliotheque Meta. Chaque video recue part
+# aussitot dans Cloudflare R2, les meilleures pubs d'abord, plafond 8 Go.
+#
+# A la main seulement, tant que la source n'est pas choisie. Sans le secret SOURCE_PUBS_URL, la tache ne fait rien.
+# Un refus de la source (401, 403, 429) arrete tout et se signale : pas de nouvel essai, pas de contournement.
+on:
+  workflow_dispatch:
+    inputs:
+      pays:
+        description: "Pays (ex. CI,SN). Vide = tous ceux de Pub Track."
+        required: false
+      depuis:
+        description: "Seulement les pubs lancees depuis ce jour (AAAA-MM-JJ). Vide = tout ce que la source rend."
+        required: false
+      pages:
+        description: "Pages de la source au plus (vide = 20)."
+        required: false
+concurrency:
+  group: source-autorisee
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  collecter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: ffmpeg
+        run: command -v ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+      - name: Collecter depuis la source autorisee
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SOURCE_PUBS_URL: ${{ secrets.SOURCE_PUBS_URL }}
+          SOURCE_PUBS_CLE: ${{ secrets.SOURCE_PUBS_CLE }}
+          SOURCE_PUBS_VIDEOS_META: ${{ vars.SOURCE_PUBS_VIDEOS_META }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_PUB_TRACK: ${{ secrets.R2_BUCKET_PUB_TRACK }}
+          R2_URL_PUBLIQUE_PUB_TRACK: ${{ secrets.R2_URL_PUBLIQUE_PUB_TRACK }}
+          PAYS: ${{ github.event.inputs.pays }}
+          DEPUIS: ${{ github.event.inputs.depuis }}
+          PAGES: ${{ github.event.inputs.pages }}
+        run: |
+          ARGS=""
+          case "$PAGES" in *[!0-9]*) echo "pages : un nombre seulement" >&2; exit 1;; esac
+          case "$PAYS" in *[!A-Za-z,]*) echo "pays : des codes a deux lettres separes par des virgules" >&2; exit 1;; esac
+          case "$DEPUIS" in ""|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) echo "depuis : AAAA-MM-JJ" >&2; exit 1;; esac
+          if [ -n "$PAYS" ]; then ARGS="$ARGS --pays $PAYS"; fi
+          if [ -n "$DEPUIS" ]; then ARGS="$ARGS --depuis $DEPUIS"; fi
+          if [ -n "$PAGES" ]; then ARGS="$ARGS --pages $PAGES"; fi
+          npx tsx scripts/pub-track/collecter-source.ts $ARGS

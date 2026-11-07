@@ -9,7 +9,16 @@ name: Classeur IA
 on:
   schedule:
     - cron: "47 5 * * *"
+  # Lancement a la main (07/11/2026) : passer le stock deja en base. La limite gratuite tient : un refus de quota
+  # arrete la tache, qui reprend la nuit suivante.
   workflow_dispatch:
+    inputs:
+      max:
+        description: "Pubs a classer au plus (vide = 600, le budget de nuit ; ex. 3000 pour le stock)."
+        required: false
+      minutes:
+        description: "Minutes au plus (vide = 40 ; 55 au maximum)."
+        required: false
 concurrency:
   group: classeur
   cancel-in-progress: false
@@ -18,7 +27,7 @@ permissions:
 jobs:
   classer:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,4 +41,11 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CLASSEUR_GRATUIT: oui
-        run: npx tsx scripts/pub-track/classer-produits.ts
+          MAX: ${{ github.event.inputs.max }}
+          MINUTES: ${{ github.event.inputs.minutes }}
+        run: |
+          ARGS=""
+          case "$MAX$MINUTES" in *[!0-9]*) echo "max et minutes : des nombres seulement" >&2; exit 1;; esac
+          if [ -n "$MAX" ]; then ARGS="$ARGS --max $MAX"; fi
+          if [ -n "$MINUTES" ]; then ARGS="$ARGS --minutes $(( MINUTES > 55 ? 55 : MINUTES ))"; fi
+          npx tsx scripts/pub-track/classer-produits.ts $ARGS

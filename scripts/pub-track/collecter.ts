@@ -21,7 +21,6 @@
  * Variables : NEXT_PUBLIC_SUPABASE_URL (ou SUPABASE_URL), SUPABASE_SERVICE_ROLE_KEY.
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import sharp from 'sharp';
 
 import { BUDGET_COLLECTE } from '../../lib/pub-track/budget';
 import {
@@ -62,8 +61,10 @@ import {
   versLigne,
   type LignePub,
 } from './analyser-reponse';
+import { colonneAbsente, ecrireRecherche, fileVideosCollecte, recopierMiniature } from './ecriture';
+import { deposerFile, ligneBilan } from './deposer-videos';
+import { configR2 } from '../../services/stockage/r2';
 
-const BUCKET = 'pub-track';
 const debut = Date.now();
 
 function arg(nom: string): string | null {
@@ -181,25 +182,6 @@ async function lireRequete(
   }
 }
 
-async function recopierMiniature(sb: SupabaseClient, l: LignePub): Promise<string | null> {
-  if (!l.apercu_source) return null;
-  try {
-    const r = await fetch(l.apercu_source, { signal: AbortSignal.timeout(15_000) });
-    if (!r.ok) return null;
-    const image = await sharp(Buffer.from(await r.arrayBuffer()))
-      // 720 px et une meilleure qualité (10/10/2026) : la découpe du produit (097) se fait dans cette
-      // image ; à 480 px, un produit recadré tombait sous 200 px et n'était pas utilisable.
-      .resize({ width: 720, withoutEnlargement: true })
-      .webp({ quality: 78 })
-      .toBuffer();
-    const chemin = `${l.source}/${l.id_source}.webp`;
-    const { error } = await sb.storage.from(BUCKET).upload(chemin, image, { contentType: 'image/webp', upsert: true });
-    return error ? null : chemin;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * `null` quand le site n'a pas répondu, ou a répondu par une erreur (page de
  * vérification, 5xx) : ne rien savoir n'est pas savoir qu'il est « sur mesure ».
@@ -244,27 +226,6 @@ async function lireTechnologie(domaine: string, lienPub: string | null): Promise
   return 'sur_mesure';
 }
 
-function colonnes(l: LignePub): Omit<LignePub, 'apercu_source'> & { vu_le: string; maj_le: string } {
-  const { apercu_source: _ignore, ...reste } = l;
-  const maintenant = new Date().toISOString();
-  return { ...reste, vu_le: maintenant, maj_le: maintenant };
-}
-
-/** Colonnes d'une migration peut-être pas encore appliquée (116) : sans elles, on écrit quand même le reste. */
-const COLONNES_RECENTES = ['collation_id'] as const;
-
-async function ecrireParLots(sb: SupabaseClient, lignes: Record<string, unknown>[]): Promise<void> {
-  for (let i = 0; i < lignes.length; i += 400) {
-    const lot = lignes.slice(i, i + 400);
-    const ecrire = (l: Record<string, unknown>[]) => sb.from('pub_track_pubs').upsert(l, { onConflict: 'source,id_source', defaultToNull: false });
-    let { error } = await ecrire(lot);
-    if (error && colonneAbsente(error.message)) {
-      ({ error } = await ecrire(lot.map((l) => Object.fromEntries(Object.entries(l).filter(([k]) => !(COLONNES_RECENTES as readonly string[]).includes(k))))));
-    }
-    if (error) throw new Error(`ecriture pub_track_pubs : ${error.message}`);
-  }
-}
-
 async function toutLire<T>(lire: (de: number, a: number) => PromiseLike<{ data: unknown[] | null; error: { message: string } | null }>): Promise<T[]> {
   const sortie: T[] = [];
   for (let de = 0; ; de += 1000) {
@@ -294,7 +255,7 @@ async function toutLire<T>(lire: (de: number, a: number) => PromiseLike<{ data: 
  * - TikTok : la catégorie posée à la lecture est gardée (le ciblage par pays qui la décide n'est
  *   pas en base) ; seules la niche et la clé produit sont recalculées.
  */
-async function classerBase(sb: SupabaseClient): Promise<number> {
+export async function classerBase(sb: SupabaseClient): Promise<number> {
   const colonnes =
     'id, source, marche, categorie, annonceur_id, annonceur_nom, texte, titre, appel_action, lien, domaine, destination, boutique_cle, langue, produit_famille, verdict_ia';
   const lire = (c: string) => toutLire<Record<string, string | null>>((de, a) => sb.from('pub_track_pubs').select(c).order('id').range(de, a));
@@ -380,7 +341,7 @@ async function etapeRecalcul<T>(nom: string, appel: () => PromiseLike<{ data: T 
  * 17 s et la base coupe à 8 s : la nuit du 10/10/2026 s'est arrêtée là sans fermer son journal.
  * Les jours d'activité partent par paquets de 2 000 lignes (~1,3 s chacun).
  */
-async function recalculer(sb: SupabaseClient): Promise<void> {
+export async function recalculer(sb: SupabaseClient): Promise<void> {
   const jour = new Date().toISOString().slice(0, 10);
   await etapeRecalcul('pubs', () => sb.rpc('pub_track_recalculer_pubs', { p_jour: jour }));
   for (let i = 0; i < 50; i++) {
@@ -397,7 +358,7 @@ async function recalculer(sb: SupabaseClient): Promise<void> {
  * Sans la migration 116 (pas de `verifiee_le`), aucune preuve : aucune pub ne passe gagnante. Sans la 118,
  * le score et la phrase passent par l'ancienne porte, sans statut.
  */
-async function recalculerScores(sb: SupabaseClient): Promise<number> {
+export async function recalculerScores(sb: SupabaseClient): Promise<number> {
   const variantesGroupe = new Map(
     (await toutLire<{ groupe_cle: string; variantes: number }>((de, a) => sb.from('pub_track_groupes').select('groupe_cle, variantes').range(de, a))).map((g) => [g.groupe_cle, g.variantes]),
   );
@@ -485,54 +446,6 @@ async function poserTechnologies(sb: SupabaseClient, relireTout = false, max: nu
     );
   }
   return poses;
-}
-
-/**
- * Écrit les pubs d'UNE recherche, miniatures comprises. Les miniatures se
- * recopiaient en fin de nuit seulement : une collecte coupée en route (celle du
- * 07/10/2026 à 03 h 47) laissait ses pubs sans image, et le lien fbcdn expire en
- * quelques jours. Renvoie le nombre de pubs nouvelles et de miniatures posées.
- */
-async function ecrireRecherche(
-  sb: SupabaseClient,
-  touchees: LignePub[],
-  avecMiniature: Set<string>,
-  budget: { miniatures: number },
-): Promise<{ nouvelles: number; miniatures: number }> {
-  const enBase = new Map<string, string | null>();
-  for (let i = 0; i < touchees.length; i += 500) {
-    const { data, error } = await sb
-      .from('pub_track_pubs')
-      .select('id_source, miniature_chemin')
-      .eq('source', touchees[0]?.source ?? 'meta')
-      .in('id_source', touchees.slice(i, i + 500).map((l) => l.id_source));
-    // Sans cette lecture, l'écriture remettrait à NULL les miniatures existantes : on n'écrit pas du tout.
-    if (error) throw new Error(`lecture des miniatures : ${error.message}`);
-    for (const r of (data ?? []) as { id_source: string; miniature_chemin: string | null }[]) enBase.set(r.id_source, r.miniature_chemin);
-  }
-  let miniatures = 0;
-  const aEcrire: Record<string, unknown>[] = [];
-  for (const l of touchees) {
-    const ligne: Record<string, unknown> = colonnes(l);
-    // TOUJOURS la miniature déjà en base (audit du 09/10/2026) : supabase-js écrit l'union des clés
-    // d'un lot, et une seule miniature neuve dans le lot remettait à NULL celle des autres pubs.
-    ligne.miniature_chemin = enBase.get(l.id_source) ?? null;
-    if (enBase.get(l.id_source)) avecMiniature.add(l.id_source);
-    // Une pub qu'aucun écran ne montrera (application, série, marque hors d'Afrique) ne coûte pas une image.
-    const visible = (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie);
-    if (visible && !avecMiniature.has(l.id_source) && budget.miniatures > 0) {
-      const chemin = await recopierMiniature(sb, l);
-      if (chemin) {
-        ligne.miniature_chemin = chemin;
-        avecMiniature.add(l.id_source);
-        budget.miniatures -= 1;
-        miniatures += 1;
-      }
-    }
-    aEcrire.push(ligne);
-  }
-  await ecrireParLots(sb, aEcrire);
-  return { nouvelles: touchees.filter((l) => !enBase.has(l.id_source)).length, miniatures };
 }
 
 /* ── TikTok : les vidéos des vendeurs, boostées ou non (ScrapeCreators, 09/10/2026) ─────────── */
@@ -731,6 +644,9 @@ async function verifierAnnonceurs(
 }
 
 /**
+ * PLUS APPELÉ depuis le 07/11/2026 : les vidéos se rangent dans R2 et aucun lien fbcdn n'est gardé en base.
+ * Gardé pour l'historique ; à retirer quand le stockage R2 aura fait ses preuves.
+ *
  * Le rafraîchissement des vidéos Meta (09/10/2026) : les pubs de la vitrine lues il y a plus de
  * deux jours ont une adresse vidéo qui meurt bientôt. On relit en priorité les annonceurs qui en
  * ont le plus, une page chacun, dans le budget de temps de la nuit.
@@ -775,8 +691,7 @@ async function rafraichirVideosMeta(
 
 /* ── Le journal de la nuit : verrou, saut, mesures (lot 1 de Pub Track v2) ─────────────────── */
 
-/** Tant que la migration 115 n'est pas appliquée, ses colonnes n'existent pas : on range les mesures dans le message. */
-const colonneAbsente = (m: string) => /column|colonne|schema cache|PGRST204/i.test(m);
+/* `colonneAbsente` vient de ./ecriture : tant qu'une migration (115, 116...) n'est pas appliquée, ses colonnes n'existent pas. */
 
 async function ouvrirJournal(sb: SupabaseClient, message: string, nuit: string): Promise<string> {
   const plein = await sb.from('pub_track_collectes').insert({ message, nuit, statut: 'en_cours' }).select('id').single();
@@ -1084,18 +999,9 @@ async function main(): Promise<void> {
           if (!(await chercherOccident(po, mot))) break;
         }
       }
-      if (sb && statut === 'ok') {
-        try {
-          const r = await rafraichirVideosMeta(contexte, sb, avecMiniature, budgetMiniatures);
-          console.log(`Videos Meta : ${r.annonceurs} annonceurs relus, ${r.pubs} pubs rafraichies.`);
-        } catch (err) {
-          // Un refus ici n'arrête pas la nuit : TikTok et le nommage passent quand même.
-          if (!arreter(err)) {
-            stats.erreurs += 1;
-            console.error('Videos Meta : echec', err instanceof Error ? err.message : err);
-          }
-        }
-      }
+      // Le rafraîchissement des liens vidéo Meta (`rafraichirVideosMeta`) n'est plus appelé (07/11/2026) : aucun lien
+      // fbcdn n'est plus gardé en `video_url` (lib/pub-track/video-chez-nous.ts), il n'y a donc plus rien à renouveler,
+      // et relire des annonceurs pour cela coûterait des requêtes à Meta pour rien.
     }
     finReelleMeta = Date.now();
     if (VIDEOS_TIKTOK && statut === 'ok') {
@@ -1179,6 +1085,22 @@ async function main(): Promise<void> {
     scores = await recalculerScores(sb);
   }
 
+  // LES VIDÉOS DANS R2 (07/11/2026) : la file de la collecte, les meilleures pubs d'abord, après le calcul des scores.
+  // Aucune requête à Meta ici : seulement des liens hors Meta (le collecteur ne télécharge rien sur un CDN de Meta).
+  if (fileVideosCollecte.taille) {
+    if (!configR2()) {
+      console.log(`Videos R2 : ${fileVideosCollecte.taille} videos en attente, variables R2_* absentes : rien n est depose.`);
+    } else {
+      try {
+        const b = await deposerFile(sb, fileVideosCollecte, { minutes: Number(arg('videos-minutes') ?? BUDGET_COLLECTE.videosR2Minutes), plafondOctets: BUDGET_COLLECTE.videosR2PlafondOctets });
+        console.log(ligneBilan(b));
+      } catch (err) {
+        stats.erreurs += 1;
+        console.error('Videos R2 : echec', err instanceof Error ? err.message : err);
+      }
+    }
+  }
+
   if (NOMMAGE) {
     try {
       const nm = await nommerProduits(sb, { max: BUDGET_COLLECTE.nommageParNuit, minutes: BUDGET_COLLECTE.nommageMinutes });
@@ -1205,7 +1127,12 @@ async function main(): Promise<void> {
   if (statut === 'schema') process.exitCode = 2;
 }
 
-main().catch(async (err) => {
+/**
+ * Lancé comme script seulement (`tsx scripts/pub-track/collecter.ts`) : la source autorisée (collecter-source.ts)
+ * importe le classement et les scores sans ouvrir de navigateur ni toucher à Meta.
+ */
+const LANCE_EN_SCRIPT = /collecter\.ts$/.test(process.argv[1] ?? '');
+if (LANCE_EN_SCRIPT) main().catch(async (err) => {
   console.error('collecte Pub Track : echec', err);
   if (journalOuvert) {
     const { sb, id, nuit, creneau } = journalOuvert;
