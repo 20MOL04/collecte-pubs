@@ -67,4 +67,10 @@ export const BUDGET_COLLECTE = {
   occidentRequetes: 12,
   occidentMinutes: 6,
   rafraichirAnnonceurs: 25,
+  /**
+   * Les vidéos rangées dans Cloudflare R2 (07/11/2026) : en fin de collecte, après Meta, au plus 8 minutes, les
+   * meilleures pubs d'abord. Le plafond est MESURÉ sur le bucket avant chaque dépôt : 8 Go, sous les 10 Go gratuits.
+   */
+  videosR2Minutes: 8,
+  videosR2PlafondOctets: 8 * 1024 ** 3,
 } as const;

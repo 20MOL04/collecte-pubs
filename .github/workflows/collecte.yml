@@ -49,6 +49,9 @@ jobs:
         run: |
           npm install --no-save playwright
           npx playwright install --with-deps chromium
+      # Le reencodage 480p des videos rangees dans R2 (07/11/2026). Deja present sur l'image, sinon installe.
+      - name: ffmpeg
+        run: command -v ffmpeg || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
       - name: Collecter
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -57,6 +60,12 @@ jobs:
           MOTS: ${{ github.event.inputs.mots }}
           DEPUIS: ${{ github.event.inputs.depuis }}
           MOTS_PAR_PAYS: ${{ github.event.inputs.mots_par_pays }}
+          # Les videos rangees dans Cloudflare R2 (07/11/2026). Sans elles, rien n'est depose.
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_PUB_TRACK: ${{ secrets.R2_BUCKET_PUB_TRACK }}
+          R2_URL_PUBLIQUE_PUB_TRACK: ${{ secrets.R2_URL_PUBLIQUE_PUB_TRACK }}
         # Aucune depense : ni Gemini (nommage) ni ScrapeCreators (TikTok). Seules les pubs Meta, gratuites.
         # Sans pays ni mots (cron, ou lancement a la main vide) : un creneau de la nuit.
         run: |
