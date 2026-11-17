@@ -22,7 +22,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { BUDGET_COLLECTE } from '../../lib/pub-track/budget';
 import { PAYS_PUB_TRACK } from '../../lib/pub-track/pays';
 import { lirePageSource, premiereAdresse, RefusSource, traduire } from '../../lib/pub-track/source-autorisee';
-import { configR2 } from '../../services/stockage/r2';
+import { configR2, variablesR2Absentes } from '../../services/stockage/r2';
 import { classerBase, recalculer, recalculerScores } from './collecter';
 import { deposerFile, FileVideos, ligneBilan } from './deposer-videos';
 import { ecrireRecherche } from './ecriture';
@@ -79,6 +79,8 @@ async function main(): Promise<void> {
     return;
   }
   if (!lignes.length) return;
+  // Miniatures et vidéos vont dans le bucket R2 public (15/11/2026) : sans ses variables, rien n'est écrit.
+  if (!configR2()) throw new Error(`R2 non configuré (miniatures et vidéos de Pub Track) : variables absentes ${variablesR2Absentes().join(', ')}`);
 
   const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
   const cleSb = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -104,8 +106,7 @@ async function main(): Promise<void> {
   await recalculerScores(sb);
 
   if (file.taille) {
-    if (!configR2()) console.log(`Videos R2 : ${file.taille} videos en attente, variables R2_* absentes : rien n est depose.`);
-    else console.log(ligneBilan(await deposerFile(sb, file, { minutes: Number(arg('videos-minutes') ?? 30), plafondOctets: BUDGET_COLLECTE.videosR2PlafondOctets })));
+    console.log(ligneBilan(await deposerFile(sb, file, { minutes: Number(arg('videos-minutes') ?? 30), plafondOctets: BUDGET_COLLECTE.videosR2PlafondOctets })));
   }
 
   const { error } = await sb.from('pub_track_collectes').insert({

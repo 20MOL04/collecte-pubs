@@ -6,15 +6,24 @@
  *
  * Un appel au modèle de vision par lot de 10 pubs (image + légende), jamais deux : une
  * réponse illisible laisse le lot sans nom, et `nomme_le` reste vide pour la nuit suivante.
- * Sans `GEMINI_API_KEY`, rien n'est fait : le panneau garde le repli sans modèle.
+ * Modèle : Claude Haiku, effort `low` (17/11/2026, Pub Track quitte Gemini), réglable par
+ * `CLAUDE_PUB_TRACK_COLLECTE_MODEL`. Sans `ANTHROPIC_API_KEY`, rien n'est fait : le panneau
+ * garde le repli sans modèle.
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import sharp from 'sharp';
-import { coutTexteUsd } from '../../services/ai/providers/cout-texte';
-import { modeleVisionPubTrack } from '../../lib/pub-track/modele';
+import { configR2, deposerR2, urlPubliquePubTrack, variablesR2Absentes } from '../../services/stockage/r2';
+import { referenceR2, urlPubliqueDeReference } from '../../lib/stockage/reference';
+
+/** Une miniature `r2:` vit dans le bucket R2 public, un ancien chemin dans le bucket Supabase `pub-track`. */
+const adresseImage = (base: string, chemin: string) => urlPubliqueDeReference(chemin, 'pub-track', { r2: urlPubliquePubTrack(), supabase: base });
+import { appelerClaude, ErreurClaude } from '../../services/pub-track/claude';
+import { modeleCollectePubTrack } from '../../lib/pub-track/modele';
+import { rafraichirVitrinePubTrack } from '../../lib/pub-track/rafraichir-vitrine';
 import { consigneFamilles, consigneImages, consigneNommage, lireFamilles, lireImages, lireNomsProduits, LOT_NOMMAGE, type Cadre, type PubANommer } from '../../lib/pub-track/nom-produit';
 
-const ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/models';
+/** Plafond de sortie d'un lot de dix (réflexion comprise) : un plafond, pas un achat. */
+const JETONS_MAX_LOT = 16_000;
 
 interface Ligne {
   id: string;
@@ -27,7 +36,9 @@ interface Ligne {
 
 export async function image(base: string, chemin: string): Promise<string | null> {
   try {
-    const res = await fetch(`${base}/storage/v1/object/public/pub-track/${chemin}`, { signal: AbortSignal.timeout(20_000) });
+    const adresse = adresseImage(base, chemin);
+    if (!adresse) return null;
+    const res = await fetch(adresse, { signal: AbortSignal.timeout(20_000) });
     if (!res.ok) return null;
     // 384 px suffisent pour reconnaître un objet, et coûtent quatre fois moins de jetons qu'une miniature pleine.
     const petite = await sharp(Buffer.from(await res.arrayBuffer())).resize(384, 384, { fit: 'inside' }).jpeg({ quality: 70 }).toBuffer();
@@ -45,9 +56,14 @@ const COTE_MIN_DECOUPE = 180;
  * `produits/<id>.webp`. Rend null quand la découpe serait trop petite : le kit n'enverra pas une
  * vignette illisible, il préférera ne rien envoyer.
  */
-export async function recadrerProduit(sb: SupabaseClient, base: string, chemin: string, cadre: Cadre, id: string): Promise<string | null> {
+export async function recadrerProduit(base: string, chemin: string, cadre: Cadre, id: string): Promise<string | null> {
+  // Sans R2, la découpe ne doit pas disparaître en silence : le nommage s'arrête et dit quoi poser.
+  const r2 = configR2();
+  if (!r2) throw new Error(`R2 non configuré (images produit de Pub Track) : variables absentes ${variablesR2Absentes().join(', ')}`);
   try {
-    const res = await fetch(`${base}/storage/v1/object/public/pub-track/${chemin}`, { signal: AbortSignal.timeout(20_000) });
+    const adresse = adresseImage(base, chemin);
+    if (!adresse) return null;
+    const res = await fetch(adresse, { signal: AbortSignal.timeout(20_000) });
     if (!res.ok) return null;
     const source = Buffer.from(await res.arrayBuffer());
     const { width: w = 0, height: h = 0 } = await sharp(source).metadata();
@@ -61,8 +77,9 @@ export async function recadrerProduit(sb: SupabaseClient, base: string, chemin: 
     if (droite - gauche < COTE_MIN_DECOUPE || bas - haut < COTE_MIN_DECOUPE) return null;
     const decoupe = await sharp(source).extract({ left: gauche, top: haut, width: droite - gauche, height: bas - haut }).webp({ quality: 85 }).toBuffer();
     const cible = `produits/${id}.webp`;
-    const { error } = await sb.storage.from('pub-track').upload(cible, decoupe, { contentType: 'image/webp', upsert: true });
-    return error ? null : cible;
+    // Le bucket R2 public (15/11/2026) : `produit_image_chemin` recoit la reference `r2:produits/<id>.webp`.
+    await deposerR2(r2, cible, new Uint8Array(decoupe), 'image/webp', 'public, max-age=604800');
+    return referenceR2(cible);
   } catch {
     return null;
   }
@@ -72,46 +89,99 @@ export interface Compteur {
   coutUsd: number;
   jetonsEntree: number;
   jetonsSortie: number;
+  /** Échecs du modèle de suite dans la nuit (remis à zéro au premier succès). */
+  echecsDeSuite?: number;
+}
+
+/** Échecs de suite (pas de réponse, 404 modèle, 5xx, 529, réponse inutilisable) avant d'arrêter la nuit. */
+export const ECHECS_DE_SUITE_MAX = 5;
+/** Pause après un échec : un modèle en panne ou surchargé n'est pas martelé. */
+export const PAUSE_APRES_ECHEC_MS = 7000;
+/** Échecs FACTURÉS par pub avant qu'elle sorte de la file : une seule reprise, jamais une rente (migration 148). */
+export const ECHECS_FACTURES_MAX = 2;
+
+const dormir = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+let compteurEchecs: boolean | null = null;
+/** La colonne `ia_echecs_factures` (migration 148) existe-t-elle ? Lu une fois par nuit. */
+export async function compteurEchecsDisponible(sb: SupabaseClient): Promise<boolean> {
+  if (compteurEchecs === null) {
+    const { error } = await sb.from('pub_track_pubs').select('ia_echecs_factures').limit(1);
+    compteurEchecs = !error;
+    if (error) console.error('Migration 148 absente : une pub sortira de la file des son premier echec facture.');
+  }
+  return compteurEchecs;
 }
 
 /**
- * UN appel au modèle, compté. 'arret' : clé refusée ou quota (inutile d'insister cette nuit) ;
- * 'echec' : pas de réponse exploitable ; sinon le JSON lu, ou null s'il est illisible (payé quand même).
+ * Un lot payé mais inutilisable (refus, coupé par le plafond, hors format) : chaque pub compte un échec facturé.
+ * Au deuxième, `marqueur` (`nomme_le`, `classe_le`) est posé et la pub sort de la file, sans nom. Sans la
+ * migration 148, elle sort dès le premier : mieux vaut une pub sans nom qu'un lot repayé chaque nuit.
+ * `marqueur` nul (rattrapage des images) : seul le compteur bouge, la requête des images saute les pubs au plafond.
  */
-export async function appelerGemini(cle: string, modele: string, parts: Record<string, unknown>[], compteur: Compteur): Promise<'arret' | 'echec' | { json: unknown }> {
-  try {
-    const res = await fetch(`${ENDPOINT}/${encodeURIComponent(modele)}:generateContent`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-goog-api-key': cle },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.2, maxOutputTokens: 16384 },
-      }),
-      signal: AbortSignal.timeout(90_000),
-    });
-    const corps = (await res.json().catch(() => null)) as {
-      candidates?: { content?: { parts?: { text?: string }[] } }[];
-      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; thoughtsTokenCount?: number };
-    } | null;
-    const u = corps?.usageMetadata;
-    const entree = u?.promptTokenCount ?? 0;
-    const sortieJetons = (u?.candidatesTokenCount ?? 0) + (u?.thoughtsTokenCount ?? 0);
-    compteur.jetonsEntree += entree;
-    compteur.jetonsSortie += sortieJetons;
-    compteur.coutUsd += coutTexteUsd(modele, { jetonsEntree: entree, jetonsSortie: sortieJetons });
-    if (!res.ok) {
-      console.error(`Gemini : HTTP ${res.status}`);
-      return res.status === 401 || res.status === 403 || res.status === 429 ? 'arret' : 'echec';
-    }
-    try {
-      return { json: JSON.parse(corps?.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '') };
-    } catch {
-      return { json: null };
-    }
-  } catch (err) {
-    console.error('Gemini : pas de reponse', err instanceof Error ? err.message : err);
-    return 'echec';
+export async function noterEchecsFactures(sb: SupabaseClient, ids: readonly string[], marqueur: 'nomme_le' | 'classe_le' | null): Promise<void> {
+  if (!ids.length) return;
+  const maintenant = new Date().toISOString();
+  if (!(await compteurEchecsDisponible(sb))) {
+    if (marqueur) await sb.from('pub_track_pubs').update({ [marqueur]: maintenant }).in('id', [...ids]);
+    return;
   }
+  const { data } = await sb.from('pub_track_pubs').select('id, ia_echecs_factures').in('id', [...ids]);
+  await Promise.all(
+    ((data ?? []) as { id: string; ia_echecs_factures: number | null }[]).map((l) => {
+      const n = (l.ia_echecs_factures ?? 0) + 1;
+      return sb
+        .from('pub_track_pubs')
+        .update({ ia_echecs_factures: n, ...(marqueur && n >= ECHECS_FACTURES_MAX ? { [marqueur]: maintenant } : {}) })
+        .eq('id', l.id);
+    }),
+  );
+}
+
+/**
+ * UN appel au modèle, compté, jamais deux. 'arret' : clé refusée, débit ou solde épuisé, ou
+ * `ECHECS_DE_SUITE_MAX` échecs de suite (modèle introuvable, en panne, surchargé) : inutile d'insister cette
+ * nuit. 'echec' : pas de réponse ; sinon le JSON lu, ou null quand la réponse est payée mais inutilisable
+ * (refus, coupée par le plafond, hors format). Après un échec, une pause. Images : JPEG en base64 (`image()`).
+ */
+export async function appelerModele(cle: string, modele: string, texte: string, images: readonly string[], compteur: Compteur): Promise<'arret' | 'echec' | { json: unknown }> {
+  let issue: 'echec' | { json: null };
+  try {
+    const r = await appelerClaude({
+      cle,
+      modele,
+      texte,
+      images: images.map((data) => ({ mime: 'image/jpeg' as const, data })),
+      maxTokens: JETONS_MAX_LOT,
+      timeoutMs: 120_000,
+    });
+    compteur.jetonsEntree += r.jetonsEntree;
+    compteur.jetonsSortie += r.jetonsSortie;
+    compteur.coutUsd += r.coutUsd;
+    compteur.echecsDeSuite = 0;
+    return { json: r.json };
+  } catch (err) {
+    if (err instanceof ErreurClaude) {
+      // Un échec facturé reste une dépense de la nuit : il entre au compteur avant tout le reste.
+      compteur.jetonsEntree += err.jetonsEntree;
+      compteur.jetonsSortie += err.jetonsSortie;
+      compteur.coutUsd += err.costUsd;
+      console.error(err.message);
+      if (err.arret) return 'arret';
+      // Des jetons lus : le modèle a répondu (refus, coupée, hors format), le lot est payé mais inutilisable.
+      issue = err.jetonsEntree > 0 ? { json: null } : 'echec';
+    } else {
+      console.error('Claude : pas de reponse', err instanceof Error ? err.message : err);
+      issue = 'echec';
+    }
+  }
+  compteur.echecsDeSuite = (compteur.echecsDeSuite ?? 0) + 1;
+  if (compteur.echecsDeSuite >= ECHECS_DE_SUITE_MAX) {
+    console.error(`Claude : ${compteur.echecsDeSuite} echecs de suite, arret de la nuit.`);
+    return 'arret';
+  }
+  await dormir(PAUSE_APRES_ECHEC_MS);
+  return issue;
 }
 
 /** Les familles déjà rangées, les plus fréquentes d'abord : le modèle les réutilise plutôt qu'en inventer. */
@@ -127,25 +197,31 @@ export async function famillesConnues(sb: SupabaseClient, max = 150): Promise<st
  * 80, aucune image. Quelques jetons par pub.
  */
 export async function classerFamilles(sb: SupabaseClient, max: number): Promise<{ lots: number; rangees: number } & Compteur> {
-  const cle = process.env.GEMINI_API_KEY?.trim();
+  const cle = process.env.ANTHROPIC_API_KEY?.trim();
   const sortie = { lots: 0, rangees: 0, coutUsd: 0, jetonsEntree: 0, jetonsSortie: 0 };
   if (!cle) return sortie;
-  const modele = modeleVisionPubTrack();
-  const { data, error } = await sb
+  const modele = modeleCollectePubTrack();
+  const demande = sb
     .from('pub_track_pubs')
     .select('id, produit_nom, produit_recherche')
     .eq('verdict_ia', 'produit')
     .is('produit_famille', null)
-    .not('produit_nom', 'is', null)
-    .limit(max);
+    .not('produit_nom', 'is', null);
+  // Une pub dont la famille a deja coute deux echecs factures n'est plus montree au modele.
+  const filtree = (await compteurEchecsDisponible(sb)) ? demande.lt('ia_echecs_factures', ECHECS_FACTURES_MAX) : demande;
+  const { data, error } = await filtree.limit(max);
   if (error) throw new Error(`familles : ${error.message}`);
   const lignes = (data ?? []) as { id: string; produit_nom: string; produit_recherche: string | null }[];
   for (let k = 0; k < lignes.length; k += 80) {
     const lot = lignes.slice(k, k + 80);
     const connues = await famillesConnues(sb);
-    const appel = await appelerGemini(cle, modele, [{ text: consigneFamilles(lot.map((l) => ({ nom: l.produit_nom, recherche: l.produit_recherche ?? l.produit_nom })), connues) }], sortie);
+    const appel = await appelerModele(cle, modele, consigneFamilles(lot.map((l) => ({ nom: l.produit_nom, recherche: l.produit_recherche ?? l.produit_nom })), connues), [], sortie);
     if (appel === 'arret') break;
     if (appel === 'echec') continue;
+    if (appel.json === null) {
+      await noterEchecsFactures(sb, lot.map((l) => l.id), null);
+      continue;
+    }
     sortie.lots += 1;
     const familles = lireFamilles(appel.json, lot.length);
     await Promise.all(
@@ -164,21 +240,22 @@ export async function classerFamilles(sb: SupabaseClient, max: number): Promise<
  * découpe sur le produit. Lots de 10 images, sans renommer.
  */
 export async function jugerImages(sb: SupabaseClient, options: { max: number; minutes: number }): Promise<{ lots: number; nettes: number; decoupes: number } & Compteur> {
-  const cle = process.env.GEMINI_API_KEY?.trim();
+  const cle = process.env.ANTHROPIC_API_KEY?.trim();
   const base = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/$/, '');
   const sortie = { lots: 0, nettes: 0, decoupes: 0, coutUsd: 0, jetonsEntree: 0, jetonsSortie: 0 };
   if (!cle || !base) return sortie;
-  const modele = modeleVisionPubTrack();
+  const modele = modeleCollectePubTrack();
   const fin = Date.now() + options.minutes * 60_000;
-  const { data, error } = await sb
+  const demande = sb
     .from('pub_track_pubs')
     .select('id, miniature_chemin')
     .eq('verdict_ia', 'produit')
     .eq('categorie', 'physique')
     .is('produit_image_qualite', null)
-    .not('miniature_chemin', 'is', null)
-    .order('score', { ascending: false })
-    .limit(options.max);
+    .not('miniature_chemin', 'is', null);
+  // Une pub dont l'image a deja coute deux echecs factures n'est plus montree au modele.
+  const filtree = (await compteurEchecsDisponible(sb)) ? demande.lt('ia_echecs_factures', ECHECS_FACTURES_MAX) : demande;
+  const { data, error } = await filtree.order('score', { ascending: false }).limit(options.max);
   if (error) throw new Error(`images : ${error.message}`);
   const lignes = (data ?? []) as { id: string; miniature_chemin: string }[];
   for (let k = 0; k < lignes.length && Date.now() < fin; k += LOT_NOMMAGE) {
@@ -186,10 +263,13 @@ export async function jugerImages(sb: SupabaseClient, options: { max: number; mi
     const images = await Promise.all(lot.map((l) => image(base, l.miniature_chemin)));
     const garde = lot.filter((_, i) => images[i]);
     if (!garde.length) continue;
-    const parts: Record<string, unknown>[] = [{ text: consigneImages(garde.length) }, ...images.filter((x): x is string => !!x).map((d) => ({ inline_data: { mime_type: 'image/jpeg', data: d } }))];
-    const appel = await appelerGemini(cle, modele, parts, sortie);
+    const appel = await appelerModele(cle, modele, consigneImages(garde.length), images.filter((x): x is string => !!x), sortie);
     if (appel === 'arret') break;
-    if (appel === 'echec' || appel.json === null) continue;
+    if (appel === 'echec') continue;
+    if (appel.json === null) {
+      await noterEchecsFactures(sb, garde.map((l) => l.id), null);
+      continue;
+    }
     sortie.lots += 1;
     const verdicts = lireImages(appel.json, garde.length);
     await Promise.all(
@@ -197,7 +277,7 @@ export async function jugerImages(sb: SupabaseClient, options: { max: number; mi
         const v = verdicts[i];
         if (!v) return;
         if (v.image === 'net') sortie.nettes += 1;
-        const decoupe = v.cadre ? await recadrerProduit(sb, base, l.miniature_chemin, v.cadre, l.id) : null;
+        const decoupe = v.cadre ? await recadrerProduit(base, l.miniature_chemin, v.cadre, l.id) : null;
         if (decoupe) sortie.decoupes += 1;
         await sb.from('pub_track_pubs').update({ produit_image_qualite: v.image, produit_image_chemin: decoupe }).eq('id', l.id);
       }),
@@ -210,14 +290,14 @@ export async function nommerProduits(
   sb: SupabaseClient,
   options: { max: number; minutes: number; source?: string },
 ): Promise<{ lots: number; nommees: number; rejetees: number; illisibles: number; coutUsd: number; jetonsEntree: number; jetonsSortie: number }> {
-  const cle = process.env.GEMINI_API_KEY?.trim();
+  const cle = process.env.ANTHROPIC_API_KEY?.trim();
   const base = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/$/, '');
   const sortie = { lots: 0, nommees: 0, rejetees: 0, illisibles: 0, coutUsd: 0, jetonsEntree: 0, jetonsSortie: 0 };
   if (!cle || !base) {
-    console.log('Nommage : GEMINI_API_KEY absente, saute.');
+    console.log('Nommage : ANTHROPIC_API_KEY absente, saute.');
     return sortie;
   }
-  const modele = modeleVisionPubTrack();
+  const modele = modeleCollectePubTrack();
   const fin = Date.now() + options.minutes * 60_000;
 
   let r = sb
@@ -244,16 +324,16 @@ export async function nommerProduits(
     const imgs = images.filter((x): x is string => !!x);
     if (!garde.length) continue;
     const pubs: PubANommer[] = garde.map((l) => ({ texte: l.texte ?? '', titre: l.titre ?? '', niche: l.niche, typeProduit: l.categorie === 'digital' ? 'digital' : 'physique' }));
-    const parts: Record<string, unknown>[] = [{ text: consigneNommage(pubs, connues) }, ...imgs.map((d) => ({ inline_data: { mime_type: 'image/jpeg', data: d } }))];
-
-    const appel = await appelerGemini(cle, modele, parts, sortie);
+    const appel = await appelerModele(cle, modele, consigneNommage(pubs, connues), imgs, sortie);
     if (appel === 'arret') break;
     if (appel === 'echec') continue;
     sortie.lots += 1;
     const json = appel.json;
     if (json === null) {
-      // Réponse payée mais illisible (souvent coupée par le plafond) : comptée, le lot sera repris une fois.
+      // Réponse payée mais inutilisable (refus, coupée, hors format) : comptée, et chaque pub du lot note un
+      // échec facturé. Le lot est repris UNE fois ; au deuxième échec, ses pubs sortent de la file sans nom.
       sortie.illisibles += 1;
+      await noterEchecsFactures(sb, garde.map((l) => l.id), 'nomme_le');
       continue;
     }
     const noms = lireNomsProduits(json, garde.length);
@@ -268,7 +348,7 @@ export async function nommerProduits(
         }
         if (n.vend) sortie.nommees += 1;
         else sortie.rejetees += 1;
-        const decoupe = n.vend && n.cadre && l.categorie !== 'digital' ? await recadrerProduit(sb, base, l.miniature_chemin, n.cadre, l.id) : null;
+        const decoupe = n.vend && n.cadre && l.categorie !== 'digital' ? await recadrerProduit(base, l.miniature_chemin, n.cadre, l.id) : null;
         await sb
           .from('pub_track_pubs')
           .update({
@@ -299,6 +379,10 @@ if (direct) {
   const sb = createClient(url, cleSb, { auth: { persistSession: false } });
   if (process.argv.includes('--images')) {
     jugerImages(sb, { max: Number(arg('max') ?? 2000), minutes: Number(arg('minutes') ?? 60) })
+      .then(async (s) => {
+        await rafraichirVitrinePubTrack(sb);
+        return s;
+      })
       .then((s) => console.log(`Images : ${s.lots} lots, ${s.nettes} produits nets, ${s.decoupes} decoupes, ${s.jetonsEntree} jetons lus, ${s.jetonsSortie} ecrits.`))
       .catch((err) => {
         console.error(err);
@@ -306,6 +390,10 @@ if (direct) {
       });
   } else if (process.argv.includes('--familles')) {
     classerFamilles(sb, Number(arg('max') ?? 5000))
+      .then(async (s) => {
+        await rafraichirVitrinePubTrack(sb);
+        return s;
+      })
       .then((s) => console.log(`Familles : ${s.lots} lots, ${s.rangees} pubs rangees, ${s.jetonsEntree} jetons lus, ${s.jetonsSortie} ecrits.`))
       .catch((err) => {
         console.error(err);
@@ -313,7 +401,11 @@ if (direct) {
       });
   } else
   nommerProduits(sb, { max: Number(arg('max') ?? 400), minutes: Number(arg('minutes') ?? 30), source: arg('source') ?? undefined })
-    .then((s) => console.log(`Nommage : ${s.lots} lots, ${s.nommees} produits nommes, ${s.rejetees} rejetes (pas un produit), ${s.illisibles} lots illisibles, ${s.jetonsEntree} jetons lus, ${s.jetonsSortie} ecrits, ~${s.coutUsd.toFixed(3)} $ (estimation haute).`))
+    .then(async (s) => {
+      await rafraichirVitrinePubTrack(sb);
+      return s;
+    })
+    .then((s) => console.log(`Nommage : ${s.lots} lots, ${s.nommees} produits nommes, ${s.rejetees} rejetes (pas un produit), ${s.illisibles} lots illisibles, ${s.jetonsEntree} jetons lus, ${s.jetonsSortie} ecrits, ~${s.coutUsd.toFixed(4)} $ (releve Anthropic).`))
     .catch((err) => {
       console.error(err);
       process.exit(1);

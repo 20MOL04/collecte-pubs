@@ -3,14 +3,15 @@ name: Classeur IA
 # de la pub, lus sur l'image par un modele de vision. Tache A PART de la collecte : aucun navigateur, aucune
 # lecture Meta, son propre groupe. Elle passe apres le dernier creneau de la nuit (04 h 37).
 #
-# GRATUIT (decision de l'equipe : aucun budget) : GEMINI_API_KEY doit venir d'un projet Google AI Studio
-# SANS facturation. La tache respecte la limite gratuite (une requete toutes les 7 s) et s'arrete au premier
-# refus de quota ; elle reprend la nuit suivante. Sans cle, elle ne fait rien.
+# Modele : Claude Haiku 5.5, effort low (17/11/2026, Pub Track quitte Gemini). Une requete toutes les 7 s au plus ;
+# une cle refusee, un debit (429) ou un solde epuise arrete la tache, 5 echecs de suite aussi ; elle reprend la nuit
+# suivante. Le cout range est le releve d'Anthropic, echecs factures compris. Sans ANTHROPIC_API_KEY, rien n'est fait.
+# Les decoupes des produits vont dans Cloudflare R2 (15/11/2026) : sans les secrets R2_*, la tache s'arrete.
 on:
   schedule:
     - cron: "47 5 * * *"
-  # Lancement a la main (07/11/2026) : passer le stock deja en base. La limite gratuite tient : un refus de quota
-  # arrete la tache, qui reprend la nuit suivante.
+  # Lancement a la main (07/11/2026) : passer le stock deja en base. Un refus de debit ou de solde arrete la tache,
+  # qui reprend la nuit suivante.
   workflow_dispatch:
     inputs:
       max:
@@ -39,8 +40,13 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CLASSEUR_GRATUIT: oui
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Les miniatures se lisent dans R2, les decoupes des produits y sont deposees (15/11/2026).
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_PUB_TRACK: ${{ secrets.R2_BUCKET_PUB_TRACK }}
+          R2_URL_PUBLIQUE_PUB_TRACK: ${{ secrets.R2_URL_PUBLIQUE_PUB_TRACK }}
           MAX: ${{ github.event.inputs.max }}
           MINUTES: ${{ github.event.inputs.minutes }}
         run: |

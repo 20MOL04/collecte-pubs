@@ -7,9 +7,9 @@
  * verdict, type, qualité créative et découpe du produit. Le type devient la catégorie, contrôlée par les
  * règles (`categorieAvecClasseur`).
  *
- * Gratuit : clé Gemini de la version gratuite (projet SANS facturation). `CLASSEUR_GRATUIT=oui` (posé par
- * le workflow) range un coût facturé de zéro et indique seulement l'équivalent payant. Un refus de quota
- * arrête la nuit. Sans clé, rien n'est fait.
+ * Modèle : Claude Haiku, effort `low` (décision du fondateur, 17/11/2026 : Pub Track quitte Gemini et sa
+ * version gratuite). Le coût range le relevé d'Anthropic, échecs facturés compris. Une clé refusée, un débit
+ * ou un solde épuisé arrête la nuit. Sans `ANTHROPIC_API_KEY`, rien n'est fait.
  *
  *   npx tsx scripts/pub-track/classer-produits.ts [--max 600] [--minutes 40]
  */
@@ -18,9 +18,10 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { CATEGORIES_VISIBLES, categorieAvecClasseur, type CategoriePub } from '../../lib/pub-track/categorie';
 import { CLASSEUR, consigneClasseur, coutFacture, lireClassement } from '../../lib/pub-track/classeur';
 import { mesures, cleNuit } from '../../lib/pub-track/creneaux';
-import { modeleVisionPubTrack } from '../../lib/pub-track/modele';
+import { modeleCollectePubTrack } from '../../lib/pub-track/modele';
 import type { PubANommer } from '../../lib/pub-track/nom-produit';
-import { appelerGemini, famillesConnues, image, recadrerProduit, type Compteur } from './nommer-produits';
+import { rafraichirVitrinePubTrack } from '../../lib/pub-track/rafraichir-vitrine';
+import { appelerModele, famillesConnues, image, noterEchecsFactures, recadrerProduit, type Compteur } from './nommer-produits';
 
 interface Candidate {
   id: string;
@@ -38,14 +39,14 @@ export async function classerProduits(
   sb: SupabaseClient,
   options: { max: number; minutes: number },
 ): Promise<{ lots: number; classees: number; rejetees: number; illisibles: number; saas: number; arret: string | null } & Compteur> {
-  const cle = process.env.GEMINI_API_KEY?.trim();
+  const cle = process.env.ANTHROPIC_API_KEY?.trim();
   const base = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').replace(/\/$/, '');
   const sortie = { lots: 0, classees: 0, rejetees: 0, illisibles: 0, saas: 0, arret: null as string | null, coutUsd: 0, jetonsEntree: 0, jetonsSortie: 0 };
   if (!cle || !base) {
-    sortie.arret = 'GEMINI_API_KEY absente : rien n a ete fait';
+    sortie.arret = 'ANTHROPIC_API_KEY absente : rien n a ete fait';
     return sortie;
   }
-  const modele = modeleVisionPubTrack();
+  const modele = modeleCollectePubTrack();
   const fin = Date.now() + options.minutes * 60_000;
   const { data, error } = await sb
     .from('pub_track_pubs')
@@ -77,22 +78,19 @@ export async function classerProduits(
     if (sansImage.length) await sb.from('pub_track_pubs').update({ classe_le: new Date().toISOString() }).in('id', sansImage);
     if (!garde.length) continue;
     const pubs: PubANommer[] = garde.map((l) => ({ texte: l.texte ?? '', titre: l.titre ?? '', niche: l.niche, typeProduit: null }));
-    const parts: Record<string, unknown>[] = [{ text: consigneClasseur(pubs, connues) }, ...images.filter((x): x is string => !!x).map((d) => ({ inline_data: { mime_type: 'image/jpeg', data: d } }))];
-
-    const appel = await appelerGemini(cle, modele, parts, sortie);
+    const appel = await appelerModele(cle, modele, consigneClasseur(pubs, connues), images.filter((x): x is string => !!x), sortie);
     if (appel === 'arret') {
-      // Quota gratuit atteint, ou clé refusée : on s'arrête, la suite passe la nuit prochaine.
-      sortie.arret = 'quota atteint ou cle refusee';
+      // Clé, débit, solde, ou échecs de suite : la nuit prochaine.
+      sortie.arret = 'cle, debit, solde ou echecs de suite';
       break;
     }
-    if (appel === 'echec') {
-      await dormir(CLASSEUR.pauseEntreAppelsMs);
-      continue;
-    }
+    // Après un échec, `appelerModele` a déjà fait sa pause.
+    if (appel === 'echec') continue;
     sortie.lots += 1;
     if (appel.json === null) {
+      // Payé mais inutilisable : chaque pub note un échec facturé, et sort de la file au deuxième.
       sortie.illisibles += 1;
-      await dormir(CLASSEUR.pauseEntreAppelsMs);
+      await noterEchecsFactures(sb, garde.map((l) => l.id), 'classe_le');
       continue;
     }
     const classes = lireClassement(appel.json, garde.length);
@@ -108,7 +106,7 @@ export async function classerProduits(
         else sortie.rejetees += 1;
         const categorie = categorieAvecClasseur(l.categorie, c.type, c.vend);
         if (categorie === 'saas') sortie.saas += 1;
-        const decoupe = c.vend && c.cadre && categorie === 'physique' ? await recadrerProduit(sb, base, l.miniature_chemin, c.cadre, l.id) : null;
+        const decoupe = c.vend && c.cadre && categorie === 'physique' ? await recadrerProduit(base, l.miniature_chemin, c.cadre, l.id) : null;
         await sb
           .from('pub_track_pubs')
           .update({
@@ -142,13 +140,13 @@ if (direct) {
   const cleSb = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!url || !cleSb) throw new Error('SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis');
   const sb = createClient(url, cleSb, { auth: { persistSession: false } });
-  const gratuit = process.env.CLASSEUR_GRATUIT === 'oui';
   const debut = Date.now();
   classerProduits(sb, { max: Number(arg('max') ?? CLASSEUR.maxParNuit), minutes: Number(arg('minutes') ?? CLASSEUR.minutes) })
     .then(async (s) => {
-      const facture = coutFacture(s.coutUsd, gratuit);
+      await rafraichirVitrinePubTrack(sb);
+      const facture = coutFacture(s.coutUsd);
       console.log(
-        `Classeur : ${s.lots} lots, ${s.classees} produits classes (dont ${s.saas} SaaS), ${s.rejetees} rejetes, ${s.illisibles} lots illisibles, ${s.jetonsEntree} jetons lus, ${s.jetonsSortie} ecrits, cout facture ${facture} $ (equivalent payant estime ~${s.coutUsd.toFixed(3)} $)${s.arret ? `, arret : ${s.arret}` : ''}.`,
+        `Classeur : ${s.lots} lots, ${s.classees} produits classes (dont ${s.saas} SaaS), ${s.rejetees} rejetes, ${s.illisibles} lots illisibles, ${s.jetonsEntree} jetons lus, ${s.jetonsSortie} ecrits, cout facture ${facture} $ (releve Anthropic)${s.arret ? `, arret : ${s.arret}` : ''}.`,
       );
       // Le journal de la nuit porte la dépense (094), ligne fermée d'emblée : elle ne tient jamais le verrou Meta.
       const m = mesures({ nuit: cleNuit(new Date()), creneau: 0, statut: 'hors_meta', recherches: 0, pubsLues: 0, msMeta: 0, bloqueA: null });
@@ -166,7 +164,7 @@ if (direct) {
         const repli = await sb.from('pub_track_collectes').insert({ ...ligne, message: `${ligne.message} | ${JSON.stringify(m)}` });
         if (repli.error) console.error(`journal : ${repli.error.message}`);
       }
-      console.log(`::notice title=Classeur Pub Track::${JSON.stringify({ pubs: s.classees + s.rejetees, saas: s.saas, lots: s.lots, cout_facture_usd: facture, equivalent_payant_usd: Math.round(s.coutUsd * 1000) / 1000, arret: s.arret })}`);
+      console.log(`::notice title=Classeur Pub Track::${JSON.stringify({ pubs: s.classees + s.rejetees, saas: s.saas, lots: s.lots, cout_facture_usd: facture, modele: modeleCollectePubTrack(), arret: s.arret })}`);
     })
     .catch((err) => {
       console.error(err);

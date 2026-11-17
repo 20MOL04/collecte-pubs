@@ -97,9 +97,14 @@ export const TARIF_TEXTE: Record<string, TarifTexte> = {
   // Opus 5.5 : moins cher qu'Opus 5 (tarif Anthropic relevé le 04/10/2026). Le moteur motion l'appelle pour écrire les films.
   'claude-opus-5-5': { entree: 4, sortie: 20, cache: 0.2, creationCache: 5 },
   'claude-opus-5': { entree: 5, sortie: 25, cache: 0.5, creationCache: 6.25 },
+  // Sonnet 5.5, meme tarif que Sonnet 5 (Anthropic, 06/10/2026) : sans sa ligne, il etait compte au prix d'Opus 5.
+  // Sauf la lecture du cache : 0,10 $ (0,05 fois l'entree, doc Anthropic relue le 17/11/2026), moitie de Sonnet 5.
+  'claude-sonnet-5-5': { entree: 2, sortie: 10, cache: 0.1, creationCache: 2.5 },
   'claude-sonnet-5': { entree: 2, sortie: 10, cache: 0.2, creationCache: 2.5 },
   'claude-sonnet-4-6': { entree: 3, sortie: 15, cache: 0.3, creationCache: 3.75 },
   'claude-haiku-4-5': { entree: 1, sortie: 5, cache: 0.1, creationCache: 1.25 },
+  // Haiku 5.5, tarif Anthropic jusqu'a 100 000 jetons (06/10/2026) : il nomme et classe les pubs de la nuit.
+  'claude-haiku-5-5': { entree: 0.1, sortie: 0.5, cache: 0.01, creationCache: 0.125 },
 };
 
 /**

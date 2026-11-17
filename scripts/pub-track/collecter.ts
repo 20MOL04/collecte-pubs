@@ -63,7 +63,7 @@ import {
 } from './analyser-reponse';
 import { colonneAbsente, ecrireRecherche, fileVideosCollecte, recopierMiniature } from './ecriture';
 import { deposerFile, ligneBilan } from './deposer-videos';
-import { configR2 } from '../../services/stockage/r2';
+import { configR2, variablesR2Absentes } from '../../services/stockage/r2';
 
 const debut = Date.now();
 
@@ -85,8 +85,8 @@ const pause = ([min, max]: readonly [number, number]) =>
  * l'accord écrit de l'équipe sur le budget.
  */
 const VIDEOS_TIKTOK = process.argv.includes('--tiktok-videos') && !!process.env.SCRAPECREATORS_API_KEY?.trim() && !process.argv.includes('--sans-tiktok');
-/** Le nommage des produits passe chaque nuit dès que la clé Gemini est posée. */
-const NOMMAGE = !!process.env.GEMINI_API_KEY?.trim();
+/** Le nommage des produits (Claude Haiku) passe chaque nuit dès que la clé Anthropic est posée. */
+const NOMMAGE = !!process.env.ANTHROPIC_API_KEY?.trim();
 const tempsEcoule = () =>
   (Date.now() - debut) / 60_000 >
   BUDGET_COLLECTE.dureeMaxMinutes - (VIDEOS_TIKTOK ? BUDGET_COLLECTE.tiktokVideosMinutes : 0) - (NOMMAGE ? BUDGET_COLLECTE.nommageMinutes : 0) - BUDGET_COLLECTE.rafraichirMinutes - BUDGET_COLLECTE.occidentMinutes;
@@ -755,6 +755,8 @@ async function main(): Promise<void> {
   const cle = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!sec && (!url || !cle)) throw new Error('SUPABASE_URL et SUPABASE_SERVICE_ROLE_KEY sont requis (ou --sec)');
   const sb = !sec ? createClient(url!, cle!, { auth: { persistSession: false } }) : null;
+  // Les miniatures vont dans le bucket R2 public (15/11/2026) : sans ses variables, on refuse AVANT d'ouvrir Meta.
+  if (!sec && !configR2()) throw new Error(`R2 non configuré (miniatures de Pub Track) : variables absentes ${variablesR2Absentes().join(', ')}`);
 
   // `--recalculer` : recalcul et scores seulement, sans ouvrir Meta.
   if (sb && (process.argv.includes('--recalculer') || process.argv.includes('--reclasser'))) {
@@ -809,7 +811,7 @@ async function main(): Promise<void> {
     erreurs: 0,
     empreinte_schema: null as string | null,
     message: '',
-    // La dépense Gemini du nommage, dans le journal de la nuit (migration 094).
+    // La dépense Claude du nommage, dans le journal de la nuit (migration 094).
     nommage_pubs: 0,
     nommage_jetons_entree: 0,
     nommage_jetons_sortie: 0,
@@ -1073,7 +1075,7 @@ async function main(): Promise<void> {
     for (const { id_source } of sansImage) {
       if (budgetMiniatures.miniatures <= 0) break;
       const l = vues.get(id_source);
-      const chemin = l ? await recopierMiniature(sb, l) : null;
+      const chemin = l ? await recopierMiniature(l) : null;
       if (!chemin) continue;
       budgetMiniatures.miniatures -= 1;
       const { error } = await sb.from('pub_track_pubs').update({ miniature_chemin: chemin }).eq('source', 'meta').eq('id_source', id_source);
@@ -1108,7 +1110,7 @@ async function main(): Promise<void> {
       stats.nommage_jetons_entree = nm.jetonsEntree;
       stats.nommage_jetons_sortie = nm.jetonsSortie;
       stats.nommage_cout_usd = Math.round(nm.coutUsd * 10_000) / 10_000;
-      console.log(`Nommage : ${nm.nommees} produits nommes, ${nm.rejetees} rejetes, ${nm.illisibles} lots illisibles, ${nm.jetonsEntree} jetons lus, ${nm.jetonsSortie} ecrits, ~${nm.coutUsd.toFixed(3)} $ (estimation haute, tarif Flash absent de cout-texte).`);
+      console.log(`Nommage : ${nm.nommees} produits nommes, ${nm.rejetees} rejetes, ${nm.illisibles} lots illisibles, ${nm.jetonsEntree} jetons lus, ${nm.jetonsSortie} ecrits, ~${nm.coutUsd.toFixed(4)} $ (releve Anthropic).`);
     } catch (err) {
       stats.erreurs += 1;
       console.error('Nommage : echec', err instanceof Error ? err.message : err);

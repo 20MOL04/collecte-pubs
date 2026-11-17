@@ -10,11 +10,11 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { CATEGORIES_VISIBLES } from '../../lib/pub-track/categorie';
+import { referenceR2 } from '../../lib/stockage/reference';
 import { sourceADeposer, videoAEcrire } from '../../lib/pub-track/video-chez-nous';
 import type { LignePub } from './analyser-reponse';
+import { configR2, deposerR2, variablesR2Absentes } from '../../services/stockage/r2';
 import { FileVideos } from './deposer-videos';
-
-export const BUCKET_MINIATURES = 'pub-track';
 
 /** Tant qu'une migration n'est pas appliquée, ses colonnes n'existent pas. */
 export const colonneAbsente = (m: string) => /column|colonne|schema cache|PGRST204/i.test(m);
@@ -22,7 +22,14 @@ export const colonneAbsente = (m: string) => /column|colonne|schema cache|PGRST2
 /** La file des vidéos de la collecte en cours : remplie par `ecrireRecherche`, vidée dans R2 en fin de collecte. */
 export const fileVideosCollecte = new FileVideos();
 
-export async function recopierMiniature(sb: SupabaseClient, l: LignePub): Promise<string | null> {
+/**
+ * La miniature va dans le bucket R2 PUBLIC (15/11/2026, le projet Supabase a été bloqué par ses fichiers). La colonne
+ * `miniature_chemin` reçoit la référence `r2:<source>/<id>.webp` (`lib/stockage/reference.ts`).
+ */
+export async function recopierMiniature(l: LignePub): Promise<string | null> {
+  // Sans R2, une miniature ne doit JAMAIS devenir nulle en silence : la collecte s'arrête et dit quoi poser.
+  const r2 = configR2();
+  if (!r2) throw new Error(`R2 non configuré pour les miniatures : variables absentes ${variablesR2Absentes().join(', ')}`);
   if (!l.apercu_source) return null;
   try {
     const r = await fetch(l.apercu_source, { signal: AbortSignal.timeout(15_000) });
@@ -36,8 +43,8 @@ export async function recopierMiniature(sb: SupabaseClient, l: LignePub): Promis
       .webp({ quality: 78 })
       .toBuffer();
     const chemin = `${l.source}/${l.id_source}.webp`;
-    const { error } = await sb.storage.from(BUCKET_MINIATURES).upload(chemin, image, { contentType: 'image/webp', upsert: true });
-    return error ? null : chemin;
+    await deposerR2(r2, chemin, new Uint8Array(image), 'image/webp', 'public, max-age=604800');
+    return referenceR2(chemin);
   } catch {
     return null;
   }
@@ -111,7 +118,7 @@ export async function ecrireRecherche(
     // Une pub qu'aucun écran ne montrera (application, série, marque hors d'Afrique) ne coûte pas une image.
     const visible = (CATEGORIES_VISIBLES as readonly string[]).includes(l.categorie);
     if (visible && !avecMiniature.has(l.id_source) && budget.miniatures > 0) {
-      const chemin = await recopierMiniature(sb, l);
+      const chemin = await recopierMiniature(l);
       if (chemin) {
         ligne.miniature_chemin = chemin;
         avecMiniature.add(l.id_source);
