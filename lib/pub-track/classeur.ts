@@ -6,9 +6,9 @@
  * lots, et range : le vrai nom du produit, la recherche fournisseur, la famille, le verdict « vend un
  * produit ou non », le TYPE (physique, digital, saas), la qualité créative de 1 à 5, et le cadre du produit.
  *
- * GRATUIT, décision de l'équipe du 29/10/2026 (« je n'ai pas d'argent pour ça ») : il tourne avec une clé
- * Gemini de la version gratuite (projet SANS facturation), au rythme qu'elle autorise, et s'arrête au
- * premier refus de quota. Il reprend la nuit suivante là où il s'est arrêté (`classe_le`).
+ * Modèle : Claude Haiku (décision du fondateur, 17/11/2026 : Pub Track quitte Gemini et sa version gratuite,
+ * `lib/pub-track/modele.ts`). Chaque nuit range son coût réel ; une clé refusée, un débit ou un solde épuisé
+ * arrête la nuit. Il reprend la nuit suivante là où il s'est arrêté (`classe_le`).
  *
  * Pur : la consigne, la lecture contrôlée de la réponse, l'ordre de passage. Verrou : verify-classeur.
  */
@@ -23,8 +23,8 @@ export const CLASSEUR = {
   /** Minutes de la tâche au plus. */
   minutes: 40,
   /**
-   * Pause entre deux appels. La version gratuite limite le nombre d'appels par minute : 7 s tiennent sous
-   * 10 par minute, avec de la marge. Un refus de quota (429) arrête la nuit, jamais une relance.
+   * Pause entre deux appels : au plus 10 par minute, loin du débit du compte Anthropic partagé avec le reste
+   * du produit. Un refus de débit (429) arrête la nuit, jamais une relance.
    */
   pauseEntreAppelsMs: 7000,
 } as const;
@@ -92,7 +92,7 @@ export function lireClassement(brut: unknown, n: number): (Classement | null)[] 
   });
 }
 
-/** Le coût d'une nuit en version gratuite : zéro facturé, l'équivalent payant seulement indiqué. */
-export function coutFacture(estimationUsd: number, gratuit: boolean): number {
-  return gratuit ? 0 : Math.round(estimationUsd * 10_000) / 10_000;
+/** Le coût facturé d'une nuit, au dix-millième de dollar : le relevé d'Anthropic, échecs facturés compris. */
+export function coutFacture(releveUsd: number): number {
+  return Math.round(releveUsd * 10_000) / 10_000;
 }

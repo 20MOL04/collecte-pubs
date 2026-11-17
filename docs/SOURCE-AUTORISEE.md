@@ -97,7 +97,7 @@ Si la source refuse (401, 403 ou 429), tout s'arrête et le refus est signalé. 
 | `R2_SECRET_ACCESS_KEY` | son secret |
 | `R2_BUCKET_PUB_TRACK` | `creafrik-pub-track` |
 | `R2_URL_PUBLIQUE_PUB_TRACK` | `https://media.creafrik.com` |
-| `GEMINI_API_KEY` | la clé Google AI Studio d'un projet **sans facturation** (classeur gratuit) |
+| `ANTHROPIC_API_KEY` | la clé de l'API Claude (classeur IA, Claude Haiku 5.5) ; l'ancien secret `GEMINI_API_KEY` peut être supprimé |
 
 Pour poser les cinq secrets R2 depuis le `.env.local` de creafrik, sans jamais les afficher (PowerShell, `gh` connecté) :
 
